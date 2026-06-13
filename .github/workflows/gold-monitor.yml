@@ -1,0 +1,33 @@
+name: Gold Price Monitor
+on:
+  schedule:
+    - cron: '0 1 * * 1-5'
+    - cron: '30 4 * * 1-5'
+    - cron: '0 7 * * 1-5'
+    - cron: '0 12 * * 1-5'
+  workflow_dispatch:
+env:
+  SMTP_HOST: "smtp.163.com"
+  SMTP_PORT: "465"
+  SMTP_USER: ${{ secrets.SMTP_USER }}
+  SMTP_PASS: ${{ secrets.SMTP_PASS }}
+  RECIPIENTS: ${{ secrets.RECIPIENTS }}
+permissions:
+  contents: read
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run monitor
+        env:
+          SMTP_HOST: ${{ env.SMTP_HOST }}
+          SMTP_PORT: ${{ env.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          RECIPIENTS: ${{ secrets.RECIPIENTS }}
+        run: python cloud_gold_monitor.py
