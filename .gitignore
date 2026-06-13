@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+
+# 运行时生成文件 (这些会作为 Artifact 上传，不需要入库)
+logs/
+price_history.json
+last_state.json
+.gold_ref_cache.json
+browser_gold_data.json
+debug_*.html
+icbc_api_response.json
+test_v2_results.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
