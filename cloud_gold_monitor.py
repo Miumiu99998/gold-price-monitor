@@ -436,6 +436,30 @@ def generate_alert_html(current, prev):
 #  主逻辑
 # ============================================================
 
+def generate_status_html(current):
+    """Generate daily status report HTML email (for GitHub Actions mode)"""
+    jicun = current["jicun_estimated"]
+    lines = []
+    lines.append('<table style="width:100%;border-collapse:collapse;font-size:14px;">')
+    lines.append('  <tr><td colspan="2" style="padding:10px 0;font-size:18px;font-weight:bold;color:#b8860b;">')
+    lines.append('    Daily Gold Price Report</td></tr>')
+    lines.append('  <tr><td style="padding:6px 0;color:#666;">Accumulated Gold (Est.)</td>')
+    lines.append('    <td style="padding:6px 0;font-weight:bold;font-size:22px;color:#b8860b;">CNY %.2f/g</td></tr>' % jicun)
+    lines.append('  <tr><td style="padding:6px 0;color:#666;">Spot International</td>')
+    lines.append('    <td style="padding:6px 0;">$%.2f/oz ~ CNY %.2f/g</td></tr>' % (current["spot_usd"], current["spot_cny"]))
+    lines.append('  <tr><td style="padding:6px 0;color:#666;">Data Source</td>')
+    lines.append('    <td style="padding:6px 0;">%s</td></tr>' % current["source"])
+    lines.append('  <tr><td style="padding:6px 0;color:#666;">Updated (Beijing)</td>')
+    lines.append('    <td style="padding:6px 0;">%s</td></tr>' % current["timestamp"])
+    lines.append('</table>')
+    lines.append('<div style="margin-top:14px;padding:12px;background:#f0f7ff;border-radius:8px;')
+    lines.append('            border-left:4px solid #2196F3;font-size:13px;color:#555;">')
+    lines.append('  This is an automated daily report from GitHub Actions.')
+    lines.append('  You will receive an ALERT email when price change exceeds threshold.')
+    lines.append('</div>')
+    return "\n".join(lines)
+
+
 def main():
     print("=" * 60)
     print("  Cloud Bank Gold Monitor v3.0")
@@ -512,7 +536,12 @@ def main():
     else:
         print("First run, recording baseline price.")
 
-    # Send email if needed
+    # ---- Always send email in GitHub Actions mode ----
+    # GitHub Actions uses fresh workspace each run, so we can't persist state.
+    # Solution: always send a status email (report or alert).
+    is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+
+    # Send email
     if should_alert:
         sign = "+" if jicun > (last_state.get("jicun_estimated", 0)) else ""
         subject = "[Gold Alert] %s CNY %.2f/g (%s%.2f)" % (
@@ -523,6 +552,12 @@ def main():
         )
         body = generate_alert_html(price_data, last_state or {})
         send_email(subject, body)
+    elif is_github_actions:
+        # GitHub Actions: send daily status report every run
+        subject = "[Gold Report] CNY %.2f/g | %s" % (jicun, price_data["source"][:30])
+        body = generate_status_html(price_data)
+        send_email(subject, body)
+        print("GitHub Actions: status email sent.")
     else:
         print("OK: Price stable (change below threshold +/- %.1f CNY/g)" % CONFIG["monitor"]["price_threshold"])
 
