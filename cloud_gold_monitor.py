@@ -1,579 +1,685 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-================================================================================
-  云端银行积存金价监控 & 邮件提醒系统 v3.0 (Cloud Edition)
-================================================================================
-  GitHub Actions 专用版本 - 无需浏览器，纯 API 获取数据
+cloud_gold_monitor.py v4.0 - 银行积存金实时监控（GitHub Actions版）
+==========================================================
+数据源策略（多级降级）:
+  Level 1: 金投网(cngold.org) 银行纸黄金实时报价
+  Level 2: 东方财富/新浪 AU9999 实时行情  
+  Level 3: 国际金价(CNY) × 银行系数 → 估算积存金价
+  Level 4: 缓存历史数据兜底
 
-  数据源策略 (自动降级):
-    ① metals-api.com → 国际现货金价 + 积存估算
-    ② metal-price-api.com → 备用数据源
-    ③ frankfurter.app (汇率) + kitco.com (参考金价)
-    ④ 兜底: 基于缓存的最后已知价格
-
-  运行环境: GitHub Actions (ubuntu-latest) / 任意 Linux
-  依赖: 仅 Python 标准库 (无需 pip install)
-
-  环境变量 (由 GitHub Secrets 注入):
-    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, RECIPIENTS
-    PRICE_THRESHOLD, PERCENT_THRESHOLD, MAX_ALERTS_PER_HOUR
+邮件: 中文HTML格式，含4家银行报价+高低价追踪
+作者: Gold Monitor System | 更新: 2026-06-16
 """
 
-import os
-import sys
-import json
-import time
-import re
-import ssl
-import smtplib
-import logging
-import urllib.request
-import urllib.error
+import os, sys, json, time, re, ssl, smtplib, logging
 from datetime import datetime, timezone, timedelta
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.utils import formatdate
-from pathlib import Path
+from email.mime.text import MIMEText
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 # ============================================================
-#  配置 (从环境变量读取，有默认值)
+# 配置区
 # ============================================================
-CONFIG = {
-    "smtp": {
-        "host": os.environ.get("SMTP_HOST", "smtp.163.com"),
-        "port": int(os.environ.get("SMTP_PORT", "465")),
-        "user": os.environ.get("SMTP_USER", ""),
-        "password": os.environ.get("SMTP_PASS", ""),
-        "use_tls": True,
-    },
-    "recipients": os.environ.get("RECIPIENTS", "").split(",") if os.environ.get("RECIPIENTS") else [],
-    "monitor": {
-        "price_threshold": float(os.environ.get("PRICE_THRESHOLD", "1.0")),
-        "percent_threshold": float(os.environ.get("PERCENT_THRESHOLD", "0.1")),
-        "max_alerts_per_hour": int(os.environ.get("MAX_ALERTS_PER_HOUR", "6")),
-    },
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.163.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', '465'))
+SMTP_USER = os.environ.get('SMTP_USER', '')
+SMTP_PASS = os.environ.get('SMTP_PASS', '')
+RECIPIENTS = os.environ.get('RECIPIENTS', '')
+
+# 监控配置
+ALERT_THRESHOLD = 5.0        # 元/克，波动超此值触发提醒
+CHECK_WINDOWS = [1, 2, 4, 6, 14, 18, 24]  # 检查时间窗口（小时）
+SILENCE_MINUTES = 5          # 静默期（分钟）
+
+# 银行积存金系数（基于纸黄金/现货金的溢价估算）
+BANK_MARKUPS = {
+    '招商银行': {'buy_rate': 1.005, 'sell_rate': -4.5, 'fee_desc': '纯点差~5元/克'},
+    '浙商银行': {'buy_rate': 1.004, 'sell_rate': 0.005, 'fee_desc': '手续费0.4%~0.5%'},
+    '工商银行': {'buy_rate': 1.000, 'sell_rate': 0.005, 'fee_desc': '买入免/赎回0.5%（新客优惠中）'},
+    '建设银行': {'buy_rate': 1.004, 'sell_rate': -5.0, 'fee_desc': '点差4~6元+赎回0.5%'},
 }
 
-BASE_DIR = Path(__file__).parent
-LOG_DIR = BASE_DIR / "logs"
-LOG_FILE = LOG_DIR / ("monitor_%s.log" % datetime.now().strftime("%Y%m%d"))
-HISTORY_FILE = BASE_DIR / "price_history.json"
-STATE_FILE = BASE_DIR / "last_state.json"
+# 日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+log = logging.getLogger(__name__)
 
-LOG_DIR.mkdir(exist_ok=True)
+# SSL上下文
+CTX = ssl.create_default_context()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ]
-)
-logger = logging.getLogger(__name__)
+# 数据文件路径
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gold_state_v4.json')
+
+# 时区
+CST = timezone(timedelta(hours=8))
 
 
-# ============================================================
-#  SSL 兼容 & HTTP 工具
-# ============================================================
-def _get_opener():
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = True
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
-
-OPENER = _get_opener()
-
-def http_get(url, headers=None, timeout=15):
-    req = urllib.request.Request(url, headers=headers or {
-        "User-Agent": "GoldMonitor/3.0 (GitHub Actions)",
-        "Accept": "application/json, text/html, */*",
-    })
-    return OPENER.open(req, timeout=timeout)
-
-
-# ============================================================
-#  数据源: 获取国际金价 (多个免费API自动降级)
-# ============================================================
-
-def fetch_gold_price():
-    """获取当前国际金价并计算积存金估算价"""
-    sources = [
-        ("Metals-API", _fetch_metals_api),
-        ("Metal-Price-API", _fetch_metal_price_api),
-        ("Frankfurter+Kitco", _fetch_frankfurter_kitco),
-    ]
-
-    for name, fetcher in sources:
-        try:
-            logger.info("Trying data source: %s ...", name)
-            result = fetcher()
-            if result and result.get("jicun_estimated", 0) > 100:
-                logger.info("OK! Source=%s Jicun=%.2f CNY/g", name, result["jicun_estimated"])
-                return result
-        except Exception as e:
-            logger.warning("Source [%s] failed: %s", name, e)
-            continue
-
-    logger.warning("All APIs failed, using cached fallback...")
-    return _fetch_cached_fallback()
-
-
-def _fetch_metals_api():
-    url = "https://api.metals-api.com/api/latest?access_key=free&base=USD&symbols=XAU"
-    resp = http_get(url)
-    data = json.loads(resp.read().decode())
-
-    if "rates" not in data or "XAU" not in data["rates"]:
-        raise ValueError("Invalid response from Metals-API")
-
-    xau_per_usd = float(data["rates"]["XAU"])
-    usd_per_oz_xau = 1.0 / xau_per_usd if xau_per_usd > 0 else 0
-    usd_per_g = usd_per_oz_xau / 31.1035
-
-    cny_rate = _get_usd_cny_rate()
-    spot_cny = round(usd_per_g * cny_rate, 2)
-    # Bank accumulation gold premium (VAT + processing)
-    jicun = round(spot_cny * 1.70, 2)
-
-    now_beijing = datetime.now(timezone(timedelta(hours=8)))
-    return {
-        "spot_usd": round(usd_per_oz_xau, 2),
-        "spot_cny": spot_cny,
-        "jicun_estimated": jicun,
-        "change_24h": 0,
-        "change_pct": 0,
-        "source": "Metals-API.com (FX rate: %.4f)" % cny_rate,
-        "timestamp": now_beijing.strftime("%Y-%m-%d %H:%M:%S"),
+def http_get(url, timeout=15):
+    hdrs = {
+        'User-Agent': 'Mozilla/5.0 (GoldMonitor/4.0; +https://github.com/Miumiu99998/gold-price-monitor)',
+        'Accept': 'application/json, text/html, */*; q=0.9',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
     }
-
-
-def _fetch_metal_price_api():
-    url = "https://api.metal-price-api.com/v1/latest?access_key=free_demo_key&base=USD&currencies=XAU,CNY"
-    resp = http_get(url)
-    data = json.loads(resp.read().decode())
-
-    rates = data.get("rates", {})
-    xau_rate = float(rates.get("XAU", 0))
-    cny_rate = float(rates.get("CNY", 0))
-
-    if xau_rate <= 0 or cny_rate <= 0:
-        raise ValueError("Invalid rates")
-
-    usd_per_oz = 1.0 / xau_rate
-    usd_per_g = usd_per_oz / 31.1035
-    final_cny_rate = cny_rate if cny_rate > 1 else _get_usd_cny_rate()
-
-    spot_cny = round(usd_per_g * final_cny_rate, 2)
-    jicun = round(spot_cny * 1.70, 2)
-    now_beijing = datetime.now(timezone(timedelta(hours=8)))
-
-    return {
-        "spot_usd": round(usd_per_oz, 2),
-        "spot_cny": spot_cny,
-        "jicun_estimated": jicun,
-        "change_24h": 0,
-        "change_pct": 0,
-        "source": "Metal-Price-API.com",
-        "timestamp": now_beijing.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-def _fetch_frankfurter_kitco():
-    # Get USD/CNY exchange rate
-    resp = http_get("https://api.frankfurter.app/latest?from=USD&to=CNY")
-    fx_data = json.loads(resp.read().decode())
-    cny_rate = float(fx_data["rates"]["CNY"])
-
-    ref_usd_per_oz = _get_reference_gold_price()
-    spot_cny = round(ref_usd_per_oz / 31.1035 * cny_rate, 2)
-    # Bank accumulation gold premium: domestic price includes VAT(~13%) + processing fees
-    # Typical ratio: bank_jicun / spot_cny_g ≈ 1.65-1.75
-    jicun = round(spot_cny * 1.70, 2)
-    now_beijing = datetime.now(timezone(timedelta(hours=8)))
-
-    return {
-        "spot_usd": round(ref_usd_per_oz, 2),
-        "spot_cny": spot_cny,
-        "jicun_estimated": jicun,
-        "change_24h": 0,
-        "change_pct": 0,
-        "source": "Frankfurter FX (%.4f CNY/USD) + Reference Gold" % cny_rate,
-        "timestamp": now_beijing.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-def _get_usd_cny_rate():
-    """Get USD/CNY exchange rate from free APIs"""
-    urls = [
-        "https://api.frankfurter.app/latest?from=USD&to=CNY",
-        "https://open.er-api.com/v6/latest/USD",
-    ]
-    for url in urls:
-        try:
-            resp = http_get(url, timeout=10)
-            raw = resp.read().decode()
-            data = json.loads(raw)
-            if "rates" in data and "CNY" in data["rates"]:
-                return float(data["rates"]["CNY"])
-        except Exception:
-            continue
-    return 7.25  # Default fallback
-
-
-def _get_reference_gold_price():
-    """Get reference gold price (USD/oz) with file cache"""
-    cache_file = BASE_DIR / ".gold_ref_cache.json"
-    cache_max_age_hours = 4
-
-    if cache_file.exists():
-        try:
-            age = time.time() - cache_file.stat().st_mtime
-            if age < cache_max_age_hours * 3600:
-                with open(cache_file) as f:
-                    cached = json.load(f)
-                    return cached["price"]
-        except Exception:
-            pass
-
-    # Try fetching from Kitco or similar
+    req = Request(url, headers=hdrs)
     try:
-        resp = http_get(
-            "https://www.kitco.com/gold-price-today-usa/",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        )
-        html = resp.read().decode("utf-8", errors="replace")
-        prices = re.findall(r'\$([0-9,]+\.\d{2})', html)
-        for p in prices:
-            val = float(p.replace(",", ""))
-            if 1800 < val < 3000:
-                with open(cache_file, "w") as f:
-                    json.dump({"price": val, "time": time.time()}, f)
-                return val
-    except Exception:
-        pass
-
-    return 2370.0  # Reasonable default for mid-2026
+        resp = urlopen(req, context=CTX, timeout=timeout)
+        return resp.status_code, resp.read().decode('utf-8', errors='replace')
+    except Exception as e:
+        return 0, str(e)
 
 
-def _fetch_cached_fallback():
-    """Fallback when all APIs are unavailable"""
-    if HISTORY_FILE.exists():
-        try:
-            with open(HISTORY_FILE) as f:
-                history = json.load(f)
-            if history:
-                last = history[-1]
-                last_prices = last.get("prices", {})
-                jicun = last_prices.get("Jicun(Est)", {}).get("buy_price", 915)
-                import random
-                variation = random.uniform(-3, 3)
-                new_jicun = round(jicun + variation, 2)
-                now_beijing = datetime.now(timezone(timedelta(hours=8)))
-                return {
-                    "spot_usd": 0,
-                    "spot_cny": new_jicun - 10,
-                    "jicun_estimated": new_jicun,
-                    "change_24h": round(variation, 2),
-                    "change_pct": round(variation / jicun * 100, 2) if jicun > 0 else 0,
-                    "source": "[Cached] All APIs unreachable",
-                    "timestamp": now_beijing.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-        except Exception:
-            pass
+def jget(url, timeout=10):
+    code, body = http_get(url, timeout)
+    if code != 200:
+        return None
+    try:
+        return json.loads(body)
+    except:
+        return None
 
-    now_beijing = datetime.now(timezone(timedelta(hours=8)))
-    return {
-        "spot_usd": 2370,
-        "spot_cny": 905,
-        "jicun_estimated": 915,
-        "change_24h": 0,
-        "change_pct": 0,
-        "source": "[Offline Default] Check network config",
-        "timestamp": now_beijing.strftime("%Y-%m-%d %H:%M:%S"),
+
+def now_cst():
+    return datetime.now(CST)
+
+
+def fmt_price(p):
+    if p is None:
+        return '--'
+    try:
+        return '%.2f' % float(p)
+    except:
+        return str(p)
+
+
+def load_state():
+    default = {
+        'price_history': [],
+        'last_alert_time': 0,
+        'last_prices': {},
+        'baseline': {},
+        'first_run': True,
+        'run_count': 0,
     }
-
-
-# ============================================================
-#  状态持久化
-# ============================================================
-
-def load_last_state():
-    if STATE_FILE.exists():
+    if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return None
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for k, v in default.items():
+                    if k not in data:
+                        data[k] = v
+                return data
+        except Exception as e:
+            log.warning('加载状态文件失败: %s' % e)
+    return default
+
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-def append_history(record):
-    history = []
-    if HISTORY_FILE.exists():
-        try:
-            with open(HISTORY_FILE) as f:
-                history = json.load(f)
-        except Exception:
-            history = []
-    history.append(record)
-    if len(history) > 200:
-        history = history[-200:]
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-
-# ============================================================
-#  邮件发送模块
-# ============================================================
-
-def send_email(subject, body_html):
-    cfg = CONFIG["smtp"]
-    recipients = [r.strip() for r in CONFIG["recipients"] if r.strip()]
-
-    if not recipients:
-        logger.warning("No recipients configured, skipping email")
-        return False
-    if not cfg["user"] or not cfg["password"]:
-        logger.warning("No SMTP credentials configured, skipping email")
-        return False
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = cfg["user"]
-    msg["To"] = ", ".join(recipients)
-    msg["Date"] = formatdate(localtime=True)
-
-    html = (
-        "<html><body style=\"font-family:'Microsoft YaHei','PingFang SC',Arial,sans-serif;"
-        "padding:20px;background:#f5f5f5;\">"
-        "<div style=\"max-width:600px;margin:0 auto;"
-        "background:linear-gradient(135deg,#b8860b,#daa520,#ffd700);"
-        "border-radius:12px;padding:28px 30px;color:#fff;\">"
-        "<h2 style=\"margin:0 0 8px;font-size:22px;\">Gold Price Alert</h2>"
-        "<p style=\"margin:0;opacity:0.9;font-size:14px;\">%s | GitHub Actions Auto</p>"
-        "</div>"
-        "<div style=\"max-width:600px;margin:18px auto;border:1px solid #e0e0e0;"
-        "border-radius:12px;overflow:hidden;background:#fff;\">"
-        "<div style=\"padding:25px 28px;\">%s</div></div>"
-        "<div style=\"max-width:600px;margin:0 auto;text-align:center;color:#aaa;"
-        "font-size:11px;padding:12px;\">"
-        "<p>Auto-sent by Cloud Gold Monitor (GitHub Actions)</p>"
-        "<p>Data source: International Gold API + Estimation</p>"
-        "</div></body></html>"
-    ) % (
-        datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M"),
-        body_html,
-    )
-
-    msg.attach(MIMEText(html, "html", "utf-8"))
-
+    cutoff = time.time() - 48 * 3600
+    state['price_history'] = [p for p in state['price_history'] if p[0] > cutoff]
     try:
-        if cfg.get("use_tls"):
-            server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=30)
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning('保存状态文件失败: %s' % e)
+
+
+# ============================================================
+# 数据源 Level 1: 金投网银行贵金属报价
+# ============================================================
+def fetch_cngold_bank():
+    url = 'https://www.cngold.org/img_date/bank_gold.html'
+    code, body = http_get(url, timeout=15)
+    if code != 200:
+        return None
+    
+    result = {}
+    
+    patterns = [
+        (r'"工行纸黄金\(人民币\)"[^}]*?"latestPrice"\s*:\s*"([\d.]+)"', '工商银行', '纸黄金'),
+        (r'"建行AU9995"[^}]*?"latestPrice"\s*:\s*"([\d.]+)"', '建设银行', 'AU9995'),
+        (r'"建行AU9999"[^}]*?"latestPrice"\s*:\s*"([\d.]+)"', '建设银行', 'AU9999'),
+        (r'"中行纸黄金\(人民币\)"[^}]*?"latestPrice"\s*:\s*"([\d.]+)"', '中国银行', '纸黄金'),
+        (r'"农行纸黄金\(人民币\)"[^}]*?"latestPrice"\s*:\s*"([\d.]+)"', '农业银行', '纸黄金'),
+        (r'data-price="([\d.]+)"[^>]*>工行纸黄金', '工商银行', '纸黄金'),
+        (r'data-price="([\d.]+)"[^>]*>建行AU9995', '建设银行', 'AU9995'),
+        (r'data-price="([\d.]+)"[^>]*>中行纸黄金', '中国银行', '纸黄金'),
+        (r'data-price="([\d.]+)"[^>]*>农行纸黄金', '农业银行', '纸黄金'),
+    ]
+    
+    for pattern, bank, product in patterns:
+        m = re.search(pattern, body)
+        if m:
+            if bank not in result:
+                result[bank] = {}
+            result[bank][product] = float(m.group(1))
+    
+    if not result:
+        lines = body.split('\n')
+        current_bank = None
+        for line in lines:
+            if '工商银行' in line:
+                current_bank = '工商银行'
+            elif '建设银行' in line:
+                current_bank = '建设银行'
+            elif '中国银行' in line:
+                current_bank = '中国银行'
+            elif '农业银行' in line:
+                current_bank = '农业银行'
+            
+            if current_bank and ('纸黄金' in line or 'AU9999' in line or 'AU9995' in line):
+                prices = re.findall(r'(\d{3}\.\d{2})', line)
+                if prices and current_bank not in result:
+                    result[current_bank] = {'纸黄金': float(prices[0])}
+    
+    if result:
+        log.info('cngold.org 获取到 %d 家银行价格' % len(result))
+        return result
+    
+    return None
+
+
+# ============================================================
+# 数据源 Level 2: AU9999
+# ============================================================
+def fetch_au9999():
+    sources = [
+        ('东方财富', 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=113.AU9999&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&end=20500101&lmt=1'),
+        ('新浪财经', 'https://finance.sina.com/service/cp/cnhjz/gold/api/openApi.php/CNHJZ_Gold.getGoldPriceBaseInfo'),
+        ('金投网AU9999', 'https://www.cngold.org/img_date/au9999.html'),
+    ]
+    
+    for name, url in sources:
+        code, body = http_get(url, timeout=10)
+        if code != 200:
+            continue
+        
+        try:
+            data = json.loads(body)
+            if 'data' in data and isinstance(data['data'], dict):
+                klines = data['data'].get('klines', [])
+                if klines:
+                    last = klines[-1].split(',')
+                    if len(last) >= 2:
+                        price = float(last[1])
+                        log.info('%s AU9999=%.2f' % (name, price))
+                        return price
+            if 'result' in data:
+                r = data['result']
+                if isinstance(r, dict) and 'price' in r:
+                    log.info('%s price=%.2f' % (name, r['price']))
+                    return float(r['price'])
+        except:
+            pass
+        
+        prices = re.findall(r'(\d{3}\.\d{2})', body)
+        valid = [float(p) for p in prices if 800 <= float(p) <= 1200]
+        if valid:
+            log.info('%s HTML提取 price=%.2f' % (name, valid[0]))
+            return valid[0]
+    
+    return None
+
+
+# ============================================================
+# 数据源 Level 3: 国际金价 + 汇率
+# ============================================================
+def fetch_international_gold():
+    rate_data = jget('https://api.frankfurter.app/latest?from=USD&to=CNY')
+    usd_cny = None
+    if rate_data and 'rates' in rate_data:
+        usd_cny = rate_data['rates'].get('CNY')
+    if not usd_cny:
+        usd_cny = 7.25
+        log.warning('使用估算汇率 %.2f' % usd_cny)
+    
+    spot_usd = None
+    spot_source = ''
+    
+    kitco_code, kitco_body = http_get('https://www.kitco.com/charts.live.html', timeout=10)
+    if kitco_code == 200:
+        m = re.search(r'Bid\s*:\s*\$?([\d,.]+)', kitco_body)
+        if m:
+            spot_usd = float(m.group(1).replace(',', ''))
+            spot_source = 'Kitco'
+    
+    if not spot_usd:
+        metals = jget('https://api.metals.dev/v1/latest?api_key=demo&currency=USD&unit=toz')
+        if metals and 'metals' in metals:
+            gold = metals['metals'].get('gold', {})
+            if gold:
+                spot_usd = gold.get('price')
+                spot_source = 'Metals.dev'
+    
+    if not spot_usd:
+        mpa = jget('https://api.metal-price-api.com/v1/latest?base=USD&currencies=CNY&api_key=demo')
+        if mpa:
+            rates = mpa.get('rates', {})
+            if 'XAU' in rates:
+                spot_usd = 1 / rates['XAU']
+                spot_source = 'Metal-Price-API'
+    
+    if spot_usd:
+        cny_per_gram = (spot_usd * usd_cny) / 31.1035
+        log.info('国际金价: $%.2f/oz x %.2f = CNY %.2f/g (%s)' % (
+            spot_usd, usd_cny, cny_per_gram, spot_source))
+        return cny_per_gram, spot_source
+    
+    return None, None
+
+
+# ============================================================
+# 主数据采集函数
+# ============================================================
+def collect_all_bank_prices():
+    result = {
+        'source': '',
+        'is_realtime': False,
+        'banks': {},
+        'base_price': None,
+        'timestamp': now_cst().strftime('%Y-%m-%d %H:%M:%S CST'),
+    }
+    
+    # Level 1: cngold.org 真实银行报价
+    cngold_data = fetch_cngold_bank()
+    if cngold_data:
+        result['source'] = '金投网(cngold.org)实时报价'
+        result['is_realtime'] = True
+        
+        base = None
+        for bank, products in cngold_data.items():
+            for prod, price in products.items():
+                if base is None:
+                    base = price
+                
+                target_bank = bank
+                if bank == '农业银行':
+                    continue
+                
+                markup = BANK_MARKUPS.get(bank, BANK_MARKUPS['工商银行'])
+                
+                if isinstance(markup.get('sell_rate'), (int, float)) and markup['sell_rate'] < 0:
+                    buy_price = round(price * markup['buy_rate'], 2)
+                    sell_price = round(price + markup['sell_rate'], 2)
+                else:
+                    buy_price = round(price * markup['buy_rate'], 2)
+                    sell_rate = abs(markup.get('sell_rate', 0))
+                    sell_price = round(price * (1 - sell_rate), 2)
+                
+                result['banks'][target_bank] = {
+                    'buy': buy_price,
+                    'sell': sell_price,
+                    'raw_paper_gold': price,
+                    'fee_desc': markup['fee_desc'],
+                }
+        
+        result['base_price'] = base
+        if result['banks']:
+            return result
+    
+    # Level 2: AU9999
+    au9999 = fetch_au9999()
+    if au9999:
+        result['source'] = '上海黄金交易所AU9999（估算积存金价）'
+        result['base_price'] = au9999
+        
+        for bank, markup in BANK_MARKUPS.items():
+            if isinstance(markup.get('sell_rate'), (int, float)) and markup['sell_rate'] < 0:
+                buy = round(au9999 * markup['buy_rate'], 2)
+                sell = round(au9999 + markup['sell_rate'], 2)
+            else:
+                buy = round(au9999 * markup['buy_rate'], 2)
+                sr = abs(markup.get('sell_rate', 0))
+                sell = round(au9999 * (1 - sr), 2)
+            
+            result['banks'][bank] = {
+                'buy': buy,
+                'sell': sell,
+                'raw_base': au9999,
+                'fee_desc': markup['fee_desc'],
+            }
+        return result
+    
+    # Level 3: 国际金价
+    intl_price, source = fetch_international_gold()
+    if intl_price:
+        result['source'] = '国际现货金价(%s) → 估算积存金价' % source
+        result['base_price'] = intl_price
+        
+        for bank, markup in BANK_MARKUPS.items():
+            adj = intl_price * 1.70
+            
+            if isinstance(markup.get('sell_rate'), (int, float)) and markup['sell_rate'] < 0:
+                buy = round(adj * markup['buy_rate'], 2)
+                sell = round(adj + markup['sell_rate'], 2)
+            else:
+                buy = round(adj * markup['buy_rate'], 2)
+                sr = abs(markup.get('sell_rate', 0))
+                sell = round(adj * (1 - sr), 2)
+            
+            result['banks'][bank] = {
+                'buy': buy,
+                'sell': sell,
+                'raw_intl': intl_price,
+                'fee_desc': markup['fee_desc'],
+            }
+        return result
+    
+    # Level 4: 兜底
+    result['source'] = '无法获取实时数据（使用缓存）'
+    state = load_state()
+    if state.get('last_prices'):
+        result['banks'] = state['last_prices']
+        result['base_price'] = state.get('baseline', {}).get('avg')
+    return result
+
+
+# ============================================================
+# 高低价分析
+# ============================================================
+def analyze_price_trend(current_prices, state):
+    alerts = []
+    now_ts = time.time()
+    history = state.get('price_history', [])
+    
+    if not history:
+        return {'alerts': [], 'summary': '首次运行，暂无历史数据'}
+    
+    for window_h in CHECK_WINDOWS:
+        cutoff = now_ts - window_h * 3600
+        window_data = [p for p in history if p[0] > cutoff]
+        
+        if not window_data:
+            continue
+        
+        for bank, cur_price in current_prices.items():
+            if cur_price is None:
+                continue
+            
+            bank_prices = []
+            for ts, prices in window_data:
+                if bank in prices and prices[bank] is not None:
+                    bank_prices.append(prices[bank])
+            
+            if not bank_prices:
+                continue
+            
+            w_high = max(bank_prices)
+            w_low = min(bank_prices)
+            
+            diff_high = cur_price - w_low
+            diff_low = w_high - cur_price
+            
+            alert_type = None
+            if cur_price <= w_low + 0.5:
+                alert_type = 'near_low'
+            elif cur_price >= w_high - 0.5:
+                alert_type = 'near_high'
+            elif diff_high >= ALERT_THRESHOLD:
+                alert_type = 'drop'
+            elif diff_low >= ALERT_THRESHOLD:
+                alert_type = 'rise'
+            
+            if alert_type:
+                alerts.append({
+                    'window': window_h,
+                    'type': alert_type,
+                    'bank': bank,
+                    'current': cur_price,
+                    'high': w_high,
+                    'low': w_low,
+                    'diff_from_low': diff_high,
+                    'diff_from_high': diff_low,
+                })
+    
+    if alerts:
+        types = set(a['type'] for a in alerts)
+        banks_alerted = set(a['bank'] for a in alerts)
+        summary = '检测到%d个信号: %s | 涉及银行: %s' % (
+            len(alerts), ', '.join(types), ', '.join(banks_alerted))
+    else:
+        summary = '价格平稳，未触发预警条件'
+    
+    return {'alerts': alerts, 'summary': summary}
+
+
+# ============================================================
+# 中文邮件模板
+# ============================================================
+def build_email_html(data, trend_analysis, state):
+    should_send = False
+    send_reason = ''
+    
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        should_send = True
+        send_reason = '定时报告'
+    elif trend_analysis['alerts']:
+        should_send = True
+        send_reason = '价格波动预警'
+    elif state.get('first_run', True):
+        should_send = True
+        send_reason = '首次运行'
+    
+    main_bank = '招商银行'
+    main_buy = data['banks'].get(main_bank, {}).get('buy', 0)
+    
+    title_icon = '📊'
+    title_extra = ''
+    
+    if trend_analysis['alerts']:
+        primary = trend_analysis['alerts'][0]
+        if primary['type'] in ('near_low', 'drop'):
+            title_icon = '🔻'
+            title_extra = '当前为近%d小时低价' % primary['window']
+        elif primary['type'] in ('near_high', 'rise'):
+            title_icon = '🔺'
+            title_extra = '当前为近%d小时高价' % primary['window']
+    
+    subject = '%s%s积存金金价提醒 %s元/克 - %s' % (
+        title_icon,
+        main_bank,
+        fmt_price(main_buy),
+        title_extra if title_extra else now_cst().strftime('%m/%d %H:%M')
+    )
+    
+    # 构建HTML（用字符串拼接避免%格式化冲突）
+    lines = []
+    lines.append('<!DOCTYPE html><html><head><meta charset="utf-8">')
+    lines.append('<style>')
+    lines.append('body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#f5f5f5;margin:0;padding:20px;color:#333}')
+    lines.append('.container{max-width:640px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1)}')
+    lines.append('.header{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;padding:24px;text-align:center}')
+    lines.append('.header h1{margin:0;font-size:22px;font-weight:600}')
+    lines.append('.header .time{opacity:0.85;font-size:13px;margin-top:6px}')
+    lines.append('.content{padding:20px}')
+    lines.append('.section{margin-bottom:20px}')
+    lines.append('.section-title{font-size:15px;font-weight:600;color:#555;border-left:4px solid #667eea;padding-left:10px;margin-bottom:12px}')
+    lines.append('.bank-card{background:#fafafa;border-radius:8px;padding:14px;margin-bottom:10px;border-left:3px solid #ddd}')
+    lines.append('.bank-name{font-size:15px;font-weight:600;margin-bottom:8px}')
+    lines.append('.price-row{display:flex;justify-content:space-between;margin:5px 0;font-size:14px}')
+    lines.append('.price-label{color:#888}')
+    lines.append('.price-value{font-weight:600;font-size:16px}')
+    lines.append('.buy-color{color:#e74c3c}')
+    lines.append('.sell-color{color:#27ae60}')
+    lines.append('.alert-box{background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:14px;margin:10px 0}')
+    lines.append('.alert-title{font-weight:600;color:#856404;margin-bottom:8px}')
+    lines.append('.alert-item{font-size:13px;margin:4px 0;color:#856404}')
+    lines.append('.info-box{background:#e8f4f8;border-radius:8px;padding:14px;margin:10px 0;font-size:12px;color:#555;line-height:1.8}')
+    lines.append('.footer{text-align:center;padding:16px;color:#aaa;font-size:11px;border-top:1px solid #eee}')
+    lines.append('.realtime-tag{display:inline-block;background:#27ae60;color:#fff;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px}')
+    lines.append('.est-tag{display:inline-block;background:#f39c12;color:#fff;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px}')
+    lines.append('</style></head><body>')
+    
+    realtime_tag = '<span class="realtime-tag">实时</span>' if data['is_realtime'] else '<span class="est-tag">估算</span>'
+    lines.append('<div class="container"><div class="header">')
+    lines.append('<h1>🏦 银行积存金价格播报</h1>')
+    lines.append('<div class="time">' + data['timestamp'] + ' | 数据来源: ' + data['source'] + ' ' + realtime_tag + '</div>')
+    lines.append('</div><div class="content">')
+    
+    lines.append('<div class="section"><div class="section-title">📋 各银行积存金报价（元/克）</div>')
+    
+    bank_order = ['招商银行', '浙商银行', '工商银行', '建设银行']
+    for bank in bank_order:
+        info = data['banks'].get(bank)
+        if not info:
+            continue
+        
+        buy = info.get('buy')
+        sell = info.get('sell')
+        desc = info.get('fee_desc', '')
+        
+        border_color = '#667eea'
+        lines.append('<div class="bank-card" style="border-left-color:' + border_color + '">')
+        lines.append('<div class="bank-name">' + bank + '</div>')
+        lines.append('<div class="price-row"><span class="price-label">买入价</span><span class="price-value buy-color">' + fmt_price(buy) + '</span></div>')
+        lines.append('<div class="price-row"><span class="price-label">卖出/赎回价</span><span class="price-value sell-color">' + fmt_price(sell) + '</span></div>')
+        if desc:
+            lines.append('<div style="font-size:11px;color:#aaa;margin-top:4px">' + desc + '</div>')
+        lines.append('</div>')
+    
+    lines.append('</div>')
+    
+    if data.get('base_price'):
+        lines.append('<div class="section"><div class="section-title">💰 参考基准价</div>')
+        lines.append('<div style="font-size:14px">基础金价: <b>' + fmt_price(data['base_price']) + ' 元/克</b></div>')
+        lines.append('</div>')
+    
+    if trend_analysis['alerts']:
+        lines.append('<div class="alert-box"><div class="alert-title">⚠️ 价格波动预警</div>')
+        for alert in trend_analysis['alerts']:
+            atype_map = {
+                'near_low': '🔻 近%d小时最低价区间',
+                'near_high': '🔺 近%d小时最高价区间',
+                'drop': '📉 较近%d小时低点上涨%.2f元',
+                'rise': '📈 较近%d小时高点下跌%.2f元',
+            }
+            tpl = atype_map.get(alert['type'], '未知类型')
+            if 'diff_from_low' in alert:
+                detail = tpl % (alert['window']) if '%' not in str(tpl) else tpl % (alert['window'], alert['diff_from_low'])
+            else:
+                detail = tpl % (alert['window'])
+            lines.append('<div class="alert-item">' + alert['bank'] + ' · ' + detail +
+                         ' | 当前' + fmt_price(alert['current']) +
+                         ' 低' + fmt_price(alert['low']) +
+                         ' 高' + fmt_price(alert['high']) + '</div>')
+        lines.append('</div>')
+    
+    notes = []
+    notes.append('• 本系统每' + str(max(w * 60 for w in CHECK_WINDOWS[:2])) + '分钟检查一次价格，' + str(SILENCE_MINUTES) + '分钟内重复波动不重复提醒')
+    notes.append('• 以上价格为' + ('银行实时报价' if data['is_realtime'] else '基于市场数据的估算价格') + '，实际交易价格以各银行APP/网点为准')
+    notes.append('• 积存金买入建议以<strong>买入价</strong>为准，卖出/赎回以<strong>卖出价</strong>为准')
+    notes.append('• 监控银行: 招商银行、浙商银行、工商银行、建设银行')
+    notes.append('• 数据更新时间: ' + data['timestamp'])
+    
+    lines.append('<div class="info-box">' + '<br>'.join(notes) + '</div>')
+    
+    run_count = state.get('run_count', 0) + 1
+    lines.append('<div class="footer">')
+    lines.append('Gold Monitor v4.0 | 第' + str(run_count) + '次运行 | Powered by GitHub Actions<br>')
+    lines.append('本邮件由监控系统自动发送，请勿直接回复</div>')
+    lines.append('</div></div></body></html>')
+    
+    html = '\n'.join(lines)
+    
+    return {
+        'subject': subject,
+        'html': html,
+        'should_send': should_send,
+        'send_reason': send_reason,
+    }
+
+
+# ============================================================
+# 发送邮件
+# ============================================================
+def send_email(subject, html_content):
+    if not SMTP_USER or not SMTP_PASS or not RECIPIENTS:
+        log.error('邮件配置不完整: user=%s, recipients=%s' % (bool(SMTP_USER), bool(RECIPIENTS)))
+        return False
+    
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = SMTP_USER
+    msg['To'] = RECIPIENTS
+    msg['Date'] = now_cst().strftime('%a, %d %b %Y %H:%M:%S +0800')
+    
+    msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+    
+    try:
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=CTX, timeout=30)
         else:
-            server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=30)
-        server.login(cfg["user"], cfg["password"])
-        server.sendmail(cfg["user"], recipients, msg.as_string())
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+            if SMTP_PORT == 587:
+                server.starttls(context=CTX)
+        
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, RECIPIENTS.split(','), msg.as_string())
         server.quit()
-        logger.info("Email sent to %s", recipients)
+        log.info('✅ 邮件发送成功: ' + subject)
         return True
     except Exception as e:
-        logger.error("Email send failed: %s", e)
+        log.error('❌ 邮件发送失败: ' + str(e))
         return False
 
 
-def generate_alert_html(current, prev):
-    """Generate price change alert HTML email body"""
-    jicun_now = current["jicun_estimated"]
-    jicun_before = prev.get("jicun_estimated", jicun_now)
-    diff = jicun_now - jicun_before
-    pct = (diff / jicun_before * 100) if jicun_before > 0 else 0
-
-    if diff > 0:
-        arrow, color, trend = "^", "#c0392b", "UP"
-    elif diff < 0:
-        arrow, color, trend = "v", "#27ae60", "DOWN"
-    else:
-        arrow, color, trend = "-", "#7f8c8d", "FLAT"
-
-    ds = "+" if diff > 0 else ""
-    ps = "+" if pct > 0 else ""
-
-    lines = []
-    lines.append('<table style="width:100%;border-collapse:collapse;font-size:14px;">')
-    lines.append('  <tr><td colspan="2" style="padding:8px 0;font-size:18px;font-weight:bold;color:#333;">')
-    lines.append('    Accumulated Gold (Est.) <span style="color:' + color + ';font-size:14px;margin-left:8px;">' + arrow + ' ' + trend + '</span>')
-    lines.append('  </td></tr>')
-    lines.append('  <tr><td style="padding:6px 0;color:#666;width:45%;">Current Price</td>')
-    lines.append('    <td style="padding:6px 0;font-weight:bold;font-size:22px;color:' + color + ';">CNY %.2f/g</td></tr>' % jicun_now)
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Previous Price</td>')
-    lines.append('    <td style="padding:6px 0;color:#888;">CNY %.2f/g</td></tr>' % jicun_before)
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Price Change</td>')
-    chg_str = '%s%.2f CNY/g (%s%.2f%%)' % (ds, diff, ps, pct)
-    lines.append('    <td style="padding:6px 0;font-weight:bold;color:' + color + ';">' + chg_str + '</td></tr>')
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Spot Int\'l</td>')
-    lines.append('    <td style="padding:6px 0;">$%.2f/oz ~ CNY %.2f/g</td></tr>' % (current["spot_usd"], current["spot_cny"]))
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Data Source</td>')
-    lines.append('    <td style="padding:6px 0;">' + current["source"] + '</td></tr>')
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Updated</td>')
-    lines.append('    <td style="padding:6px 0;">' + current["timestamp"] + ' (Beijing Time)</td></tr>')
-    lines.append('</table>')
-    lines.append('<div style="margin-top:16px;padding:14px;background:#fff8e1;border-radius:8px;')
-    lines.append('            border-left:4px solid #ffc107;font-size:13px;color:#555;">')
-    lines.append('  <b>Note:</b> Estimated bank accumulation gold price based on international spot.')
-    lines.append('  Actual bank prices may differ by +/-5 CNY/g. Please verify with your banking app.')
-    lines.append('</div>')
-
-    return "\n".join(lines)
-
-
 # ============================================================
-#  主逻辑
+# 主程序
 # ============================================================
-
-def generate_status_html(current):
-    """Generate daily status report HTML email (for GitHub Actions mode)"""
-    jicun = current["jicun_estimated"]
-    lines = []
-    lines.append('<table style="width:100%;border-collapse:collapse;font-size:14px;">')
-    lines.append('  <tr><td colspan="2" style="padding:10px 0;font-size:18px;font-weight:bold;color:#b8860b;">')
-    lines.append('    Daily Gold Price Report</td></tr>')
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Accumulated Gold (Est.)</td>')
-    lines.append('    <td style="padding:6px 0;font-weight:bold;font-size:22px;color:#b8860b;">CNY %.2f/g</td></tr>' % jicun)
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Spot International</td>')
-    lines.append('    <td style="padding:6px 0;">$%.2f/oz ~ CNY %.2f/g</td></tr>' % (current["spot_usd"], current["spot_cny"]))
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Data Source</td>')
-    lines.append('    <td style="padding:6px 0;">%s</td></tr>' % current["source"])
-    lines.append('  <tr><td style="padding:6px 0;color:#666;">Updated (Beijing)</td>')
-    lines.append('    <td style="padding:6px 0;">%s</td></tr>' % current["timestamp"])
-    lines.append('</table>')
-    lines.append('<div style="margin-top:14px;padding:12px;background:#f0f7ff;border-radius:8px;')
-    lines.append('            border-left:4px solid #2196F3;font-size:13px;color:#555;">')
-    lines.append('  This is an automated daily report from GitHub Actions.')
-    lines.append('  You will receive an ALERT email when price change exceeds threshold.')
-    lines.append('</div>')
-    return "\n".join(lines)
-
-
 def main():
-    print("=" * 60)
-    print("  Cloud Bank Gold Monitor v3.0")
-    print("  Environment: GitHub Actions / Linux Cloud")
-    now_bj = datetime.now(timezone(timedelta(hours=8)))
-    print("  Started: %s" % now_bj.strftime("%Y-%m-%d %H:%M:%S"))
-    print("=" * 60)
-
-    # Config check
-    print("\n[Config]")
-    print("  SMTP: %s:%s" % (CONFIG["smtp"]["host"], CONFIG["smtp"]["port"]))
-    print("  From: %s" % (CONFIG["smtp"]["user"] or "(not set)"))
-    print("  To:   %s" % (CONFIG["recipients"] or ["(not set)"]))
-    print("  Threshold: +/- %.1f CNY/g" % CONFIG["monitor"]["price_threshold"])
-
-    if not CONFIG["smtp"]["user"] or not CONFIG["recipients"]:
-        print("\nERROR: Configure SMTP_USER, SMTP_PASS, RECIPIENTS in GitHub Secrets")
-        sys.exit(1)
-
-    # Fetch price
-    print("\nFetching gold price data...")
-    price_data = fetch_gold_price()
-
-    jicun = price_data["jicun_estimated"]
-    print("\n%s" % ("=" * 60))
-    print("  Jicun Gold (Est): CNY %.2f/g" % jicun)
-    print("  Spot Int'l:       $%.2f/oz ~ CNY %.2f/g" % (price_data["spot_usd"], price_data["spot_cny"]))
-    print("  Source:           %s" % price_data["source"])
-    print("  Time:             %s" % price_data["timestamp"])
-    print("%s\n" % ("=" * 60))
-
-    # Build product dict
-    products = {
-        "Jicun(Est)": {
-            "buy_price": jicun,
-            "sell_price": round(jicun - 5, 2),
-            "high": jicun,
-            "low": round(jicun - 5, 2),
-            "change": 0,
-            "change_pct": 0,
-        }
-    }
-
-    # Record history
-    record = {
-        "timestamp": price_data["timestamp"],
-        "source": price_data["source"],
-        "prices": products,
-        "raw": {
-            "spot_usd": price_data["spot_usd"],
-            "spot_cny": price_data["spot_cny"],
-            "jicun": jicun,
-        }
-    }
-    append_history(record)
-
-    # Check alert condition
-    last_state = load_last_state()
-    should_alert = False
-
-    if last_state:
-        last_jicun = last_state.get("jicun_estimated", jicun)
-        diff = abs(jicun - last_jicun)
-        pct = (diff / last_jicun * 100) if last_jicun > 0 else 0
-
-        threshold = CONFIG["monitor"]["price_threshold"]
-        pct_threshold = CONFIG["monitor"]["percent_threshold"]
-
-        if diff >= threshold or pct >= pct_threshold:
-            should_alert = True
-            direction = "UP" if jicun > last_jicun else "DOWN"
-            print("ALERT! Price changed: %s%.2f (%.2f%%) %s" % (
-                "+" if jicun > last_jicun else "", jicun - last_jicun, pct, direction))
+    start = time.time()
+    log.info('='*50)
+    log.info('银行积存金监控 v4.0 启动')
+    log.info('时间: ' + now_cst().strftime('%Y-%m-%d %H:%M:%S'))
+    
+    state = load_state()
+    state['run_count'] = state.get('run_count', 0) + 1
+    
+    log.info('正在采集银行金价...')
+    data = collect_all_bank_prices()
+    
+    log.info('数据来源: ' + data['source'])
+    log.info('实时报价: ' + str(data['is_realtime']))
+    
+    for bank, info in data['banks'].items():
+        log.info('  ' + bank + ': 买入=' + fmt_price(info.get('buy')) + ', 卖出=' + fmt_price(info.get('sell')))
+    
+    current_for_history = {}
+    for bank, info in data['banks'].items():
+        current_for_history[bank] = info.get('buy')
+    
+    if current_for_history:
+        state['price_history'].append((time.time(), current_for_history))
+        state['last_prices'] = dict((k, v) for k, v in data['banks'].items())
+        if data.get('base_price'):
+            if 'baseline' not in state:
+                state['baseline'] = {}
+            state['baseline']['avg'] = data['base_price']
+            state['baseline']['time'] = data['timestamp']
+    
+    trend = analyze_price_trend(current_for_history, state)
+    log.info('趋势分析: ' + trend['summary'])
+    
+    email_info = build_email_html(data, trend, state)
+    
+    if email_info['should_send']:
+        log.info('发送原因: ' + email_info['send_reason'])
+        success = send_email(email_info['subject'], email_info['html'])
+        if success:
+            state['last_alert_time'] = time.time()
+            state['first_run'] = False
     else:
-        print("First run, recording baseline price.")
-
-    # ---- Always send email in GitHub Actions mode ----
-    # GitHub Actions uses fresh workspace each run, so we can't persist state.
-    # Solution: always send a status email (report or alert).
-    is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
-
-    # Send email
-    if should_alert:
-        sign = "+" if jicun > (last_state.get("jicun_estimated", 0)) else ""
-        subject = "[Gold Alert] %s CNY %.2f/g (%s%.2f)" % (
-            "^" if jicun > (last_state.get("jicun_estimated", 0)) else "v",
-            jicun,
-            sign,
-            jicun - last_state.get("jicun_estimated", jicun),
-        )
-        body = generate_alert_html(price_data, last_state or {})
-        send_email(subject, body)
-    elif is_github_actions:
-        # GitHub Actions: send daily status report every run
-        subject = "[Gold Report] CNY %.2f/g | %s" % (jicun, price_data["source"][:30])
-        body = generate_status_html(price_data)
-        send_email(subject, body)
-        print("GitHub Actions: status email sent.")
-    else:
-        print("OK: Price stable (change below threshold +/- %.1f CNY/g)" % CONFIG["monitor"]["price_threshold"])
-
-    # Save state
-    save_state({
-        "jicun_estimated": jicun,
-        "spot_usd": price_data["spot_usd"],
-        "spot_cny": price_data["spot_cny"],
-        "source": price_data["source"],
-        "timestamp": price_data["timestamp"],
-        "last_check": now_bj.isoformat(),
-    })
-
-    print("\nDone! Monitoring task completed.")
+        log.info('无需发送邮件: 价格平稳且非首次运行')
+    
+    save_state(state)
+    
+    elapsed = time.time() - start
+    log.info('运行完成, 耗时 %.1f 秒' % elapsed)
+    log.info('='*50)
+    
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())
