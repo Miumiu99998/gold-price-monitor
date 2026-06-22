@@ -458,7 +458,7 @@ def build_email(data, trend, state):
     
     tg_cls='tg-ok' if data['is_realtime'] else 'tg-es'; tg_txt='实时数据' if data['is_realtime'] else '估算价格'
     ap('<div class="hd"><h1>🏦 银行积存金价格播报</h1>')
-    ap('<div class="sub">%s | %s <span class="tg %s">%s</span></div>'%(data['timestamp'],data['source_detail'],tg_cls,tgt_txt))
+    ap('<div class="sub">%s | %s <span class="tg %s">%s</span></div>'%(data['timestamp'],data['source_detail'],tg_cls,tg_txt))
     ap('</div><div class="bd">')
     
     # 主银行
