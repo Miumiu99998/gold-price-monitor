@@ -429,7 +429,8 @@ def build_email(data, trend, state):
     elif trend['alerts']: send=True; reason='价格波动预警'
     elif state.get('first_run'): send=True; reason='首次运行'
     
-    L=[]; def ap(s): L.append(s)
+    L = []
+    def ap(s): L.append(s)
     ap('<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">')
     ap('<style>')
     ap('body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#f5f5f5;margin:0;padding:16px;color:#222}')
@@ -538,7 +539,7 @@ def send_email(subject, html_body):
     try:
         if SMTP_PORT==465: srv=smtplib.SMTP_SSL(SMTP_HOST,SMTP_PORT,context=_CTX,timeout=30)
         else: srv=smtplib.SMTP(SMTP_HOST,SMTP_PORT,timeout=30)
-            if SMTP_PORT==587:srv.starttls(context=_CTX)
+        if SMTP_PORT==587: srv.starttls(context=_CTX)
         srv.login(SMTP_USER,SMTP_PASS);srv.sendmail(SMTP_USER,[x.strip() for x in RECIPIENTS.split(',')],msg.as_string());srv.quit();log.info('✅ 邮件发送成功');return True
     except Exception as e: log.error('❌ 发送失败: %s'%e);return False
 
