@@ -142,8 +142,11 @@ def collect():
     }
     for bn,cfg in banks_cfg.items():
         buy=round(bank_base+cfg['add'],2)
-        sell=round(bank_base*(1-cfg.get('rate',0)) if 'rate' in cfg else round(buy-3,2)
-        results['banks'][n]={'buy':buy,'sell':sell,'fee':cfg['fee'],'color':cfg['color']}
+        if 'rate' in cfg:
+            sell=round(bank_base*(1-cfg.get('rate',0)),2)
+        else:
+            sell=round(buy-3,2)
+        results['banks'][bn]={'buy':buy,'sell':sell,'fee':cfg['fee'],'color':cfg['color']}
         l('  %s: buy=%s sell=%s'%(bn,fmt(buy),fmt(sell)))
     
     results['diag_detail']='\n'.join(lines)
@@ -224,7 +227,8 @@ def main():
                 subprocess.run(['git','config','user.name','Bot'],capture_output=True,timeout=5)
                 subprocess.run(['git','config','user.email','bot@local'],capture_output=True,timeout=5)
                 subprocess.run(['git','add','-A'],capture_output=True,timeout=10)
-                r=subprocess.run(['git','commit','-m','v4.5: diag @ %s'%data['timestamp'],'--allow-empty',capture_output=True,text=True,timeout=20)
+                cm_msg = 'v4.5: diag @ ' + data['timestamp']
+                r=subprocess.run(['git','commit','-m',cm_msg,'--allow-empty'],capture_output=True,text=True,timeout=20)
                 if 'nothing to commit' not in r.stdout and 'up to date' not in r.stdout.lower():
                     subprocess.run(['git','push','origin','main'],capture_output=True,text=True,timeout=60)
                     log.info('Git push OK')
