@@ -155,11 +155,14 @@ def save_state(state):
         log.info("State saved to local file")
     except Exception as e:
         log.warning("Save state failed: %s" % e)
-    # Write to GitHub_OUTPUT (uploaded as artifact)
+    # Write to GitHub_OUTPUT (uploaded as artifact) - use unique name
     if _GH_OUTPUT:
         try:
             os.makedirs(_GH_OUTPUT, exist_ok=True)
             alt_path = os.path.join(_GH_OUTPUT, "monitor_state.json")
+            # Remove existing file if present
+            if os.path.exists(alt_path):
+                os.remove(alt_path)
             with open(alt_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
             log.info("State also saved to GITHUB_OUTPUT")
@@ -371,7 +374,93 @@ def collect_all_prices():
                         results.append((label, pu))
                         dl("  OK: %.2f CNY/g -> $%.2f/oz" % (pg, pu))
 
+    # Source 7-10: Additional data sources
     dl("")
+    dl("Total sources found: %d" % len(results))
+
+    # Source 7: FGI (Financial Global Index) - free no-key
+    dl("[7] FGI...")
+    try:
+        d7 = jget("https://api.fgi.gov.cn/goldPrice?_=%d" % int(time.time()), 10)
+        if d7 and isinstance(d7, dict):
+            for key in ["data", "price", "goldPrice", "result", "value"]:
+                val = d7.get(key)
+                if isinstance(val, (int, float)) and 100 < val < 20000:
+                    results.append(("FGI", float(val)))
+                    dl("  OK: $%.2f (key=%s)" % (float(val), key))
+                    break
+            else:
+                dl("  Response keys: %s" % str(list(d7.keys()))[:5])
+        else:
+            dl("  FAIL")
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:60])
+
+    # Source 8: Yahoo Finance v8 alternative
+    dl("[8] Yahoo-v8...")
+    try:
+        c8, b8 = http_get(
+            "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d",
+            12,
+        )
+        if c8 == 200:
+            jd8 = json.loads(b8)
+            meta8 = (
+                jd8.get("chart", {}).get("result", [{}])[0].get("meta", {})
+                if jd8.get("chart", {}).get("result") else {}
+            )
+            for field in ["regularMarketPrice", "previousClose"]:
+                p8 = float(meta8.get(field, 0) or 0)
+                if 1000 < p8 < 15000:
+                    results.append(("Yahoo-v8-%s" % field[:6], p8))
+                    dl("  OK: $%.2f (%s)" % (p8, field))
+                    break
+            else:
+                dl("  No price")
+        else:
+            dl("  HTTP %d" % c8)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:60])
+
+    # Source 9: metals-api.com
+    dl("[9] metals-api...")
+    d9 = jget("https://metals-api.com/api/latest?access_key=demo&base=USD&symbols=XAU", 10)
+    if d9 and isinstance(d9, dict):
+        rates = d9.get("rates", {})
+        if isinstance(rates, dict) and "XAU" in rates:
+            xau = float(rates["XAU"])
+            if xau > 0.05:
+                p9 = 1.0 / xau
+                if 1000 < p9 < 15000:
+                    results.append(("Metals-API2", p9))
+                    dl("  OK: $%.2f" % p9)
+    dl("  FAIL" if not any("Metals-API2" in x[0] for x in results) else "")
+
+    # Source 10: goldprice.org scrape
+    dl("[10] GoldPriceOrg...")
+    try:
+        c10, b10 = http_get("https://goldprice.org/", 12)
+        if c10 == 200:
+            for pat_name, pat in [
+                ("gp-oz", r'(\d{1,2},?\d{3}\.\d{2})\s*(?:USD|per oz)'),
+                ("gp-usd", r'\$([\d,]+\.\d{2})'),
+            ]:
+                m = re.search(pat, b10, re.I)
+                if m:
+                    raw = m.group(1).replace(",", "")
+                    try:
+                        p10 = float(raw)
+                        if 1000 < p10 < 15000:
+                            results.append(("GoldPriceOrg", p10))
+                            dl("  OK: $%.2f" % p10); break
+                    except: pass
+        else:
+            dl("  HTTP %d" % c10)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:60])
+
+    dl("")
+    dl("=== Final: %d sources ===" % len(results))
     dl("Total sources found: %d" % len(results))
     for name, price in results:
         dl("  %s: $%.2f" % (name, price))
@@ -587,7 +676,7 @@ def send_email(data):
 
     # Footer
     rc = load_state().get("run_count", 0) + 1
-    hp("</div><div class=ft>Gold Monitor v5.0 | Run #%d | GitHub Actions<br>\u81ea\u52a8\u53d1\u751f\u53d1\uff0c\u8bf7\u56de\u590d\u56de</div></div></body></html>")
+    hp("</div><div class=ft>Gold Monitor v5.1 | Run #%d | GitHub Actions<br>\u81ea\u52a8\u53d1\u751f\u53d1\uff0c\u8bf7\u56de\u590d\u56de</div></div></body></html>")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -597,10 +686,35 @@ def send_email(data):
     msg.attach(MIMEText("\n".join(html_parts), "html", "utf-8"))
 
     try:
-        if SMTP_PORT == 466:
-            srv = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=_CTX, timeout=30)
-        else:
-            srv = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+        # Try SSL first (port 465), then STARTTLS (port 587) as fallback
+        srv = None
+        port = int(SMTP_PORT) if SMTP_PORT else 465
+        
+        # Method 1: SMTP_SSL for port 465
+        if port == 465:
+            try:
+                srv = smtplib.SMTP_SSL(SMTP_HOST, port, context=_CTX, timeout=30)
+                log.info("Connected via SSL on port %d" % port)
+            except Exception as e1:
+                log.warning("SSL failed: %s, trying STARTTLS..." % e1)
+                srv = None
+        
+        # Method 2: STARTTLS on port 587 (fallback or primary)
+        if srv is None:
+            try:
+                srv = smtplib.SMTP(SMTP_HOST, 587, timeout=30)
+                srv.starttls(context=_CTX)
+                log.info("Connected via STARTTLS on port 587")
+            except Exception as e2:
+                log.warning("STARTTLS failed: %s" % e2)
+                # Last resort: plain SMTP on configured port
+                if srv is None:
+                    try:
+                        srv = smtplib.SMTP(SMTP_HOST, port, timeout=30)
+                        log.info("Connected via plain SMTP on port %d" % port)
+                    except Exception as e3:
+                        raise Exception("All connection methods failed: SSL=%s, STARTTLS=%s, Plain=%s" % (e1, e2, e3))
+        
         srv.login(SMTP_USER, SMTP_PASS)
         srv.sendmail(
             SMTP_USER, [x.strip() for x in RECIPIENTS.split(",")], msg.as_string(),
