@@ -44,7 +44,7 @@ BANKS = {
     "\u62db\u5546\u94f6\u884c": {"add": 5.0, "color": "#E74C3C", "fee": "\u70b9\u5dee~5\u5143/\u514b"},
     "\u6d59\u5546\u94f6\u884c": {"add": 4.0, "color": "#3498DB", "fee": "\u624b\u7eed\u8d390.4%~0.5%"},
     "\u5de5\u5546\u94f6\u884c": {"add": 0.0, "rate": 0.005, "color": "#C0392B", "fee": "\u4e70\u5165\u514d/\u8d4e\u56de0.5%"},
-    "\u5efa\u8bbe\u94f6\u884c": {"add": 5.5, "color": "#27AE60", "fee": "\u70b9\udee4~6+\u8d4e\u56de0.5%"},
+    "\u5efa\u8bbe\u94f6\u884c": {"add": 5.5, "color": "#27AE60", "fee": "\u70b9\u5dee~6+\u8d4e\u56de0.5%"},
 }
 
 # Logging
@@ -381,6 +381,10 @@ def collect_all_prices():
 
 def select_best_price(prices_found, diag_lines):
     """Select best gold price from available sources."""
+    # Use local log function within this scope
+    def dl(s):
+        diag_lines.append(s)
+    
     spot = None
     src = ""
 
@@ -546,7 +550,7 @@ def send_email(data):
     hp("</style></head><body><div class=w>")
 
     hp("<div class=hd><h1>\U0001f3e0 \u94f6\u884c\u79ef\u5b58\u4ef7\u683c</h1>")
-    rt = "\u2705\u5b9e\u65f6" if data["is_realtime"] else "\u26a0\ufe0f4\u4f30\u4f30"
+    rt = "\u2705\u5b9e\u65f6" if data["is_realtime"] else "\u26a0\ufe0f \u4f30\u7b97"
     hp("<div class=sub>%s | %s | $%.2f/oz (%s) x %.4f</div>" % (
         data["timestamp"], rt,
         data.get("spot_usd", 0), data["source"], data.get("usd_cny", 0),
@@ -590,7 +594,7 @@ def send_email(data):
     msg["From"] = SMTP_USER
     msg["To"] = RECIPIENTS
     msg["Date"] = now_cst().strftime("%a, %d %b %Y %H:%M:%S +0800")
-    msg.attach(MIMEText(chr(10).join(html_parts), "html", "utf-8"))
+    msg.attach(MIMEText("\n".join(html_parts), "html", "utf-8"))
 
     try:
         if SMTP_PORT == 466:
