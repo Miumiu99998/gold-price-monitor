@@ -85,7 +85,16 @@ def http_get(url, timeout=15):
     req = Request(url, headers=hdrs)
     try:
         resp = urlopen(req, context=_CTX, timeout=timeout)
-        return resp.status_code, resp.read().decode("utf-8", errors="replace")
+        # Safe status code extraction - works with redirects and different response types
+        try:
+            code = resp.status
+        except AttributeError:
+            try:
+                code = resp.getcode()
+            except AttributeError:
+                code = 200  # If we got here without exception, assume OK
+        body = resp.read().decode("utf-8", errors="replace")
+        return code, body
     except Exception as e:
         err_str = str(e)
         log.warning("http_get ERR [%s] %s: %s" % (type(e).__name__, url[:50], err_str[:150]))
@@ -282,7 +291,7 @@ def collect_all_prices():
     log.info("[API-1b] Trying Stooq.com...")
     try:
         c_stooq, b_stooq = http_get(
-            "https://stooq.com/q/l/?s=gc.f&f=sd2t2ohlc&h&e=csv",
+            "https://stooq.com/q/l/?s=gc.f&f=sd2t2ohlc&h&e=csv&d1=20260701",
             12,
         )
         if c_stooq == 200 and b_stooq:
@@ -842,7 +851,7 @@ def send_email(data):
 
     # Footer
     rc = load_state().get("run_count", 0) + 1
-    hp("</div><div class=ft>Gold Monitor v5.2 | Run #%d | GitHub Actions<br>\u81ea\u52a8\u53d1\u751f\u53d1\uff0c\u8bf7\u56de\u590d\u56de</div></div></body></html>")
+    hp("</div><div class=ft>Gold Monitor v5.3 | Run #%d | GitHub Actions<br>\u81ea\u52a8\u53d1\u751f\u53d1\uff0c\u8bf7\u56de\u590d\u56de</div></div></body></html>")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
