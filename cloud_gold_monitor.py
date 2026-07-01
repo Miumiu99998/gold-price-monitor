@@ -317,6 +317,101 @@ def collect_all_prices():
         log.warning("[API-1b] Stooq ERR: %s" % str(e)[:80])
     log.info("[API-1b] Stooq: %s" % ("OK" if any(x[0]=="Stooq" for x in results) else "FAIL"))
 
+    # Source 1c: Eastmoney (Chinese financial site - might work since 163 SMTP works!)
+    dl("[1c] Eastmoney...")
+    log.info("[API-1c] Trying Eastmoney gold API...")
+    try:
+        # Eastmoney futures API for gold (GC = Gold Comex)
+        c_em, b_em = http_get(
+            "https://push2.eastmoney.com/api/qt/stock/get?secid=118.GC00Y&fields=f43,f44,f45,f46,f47,f57,f58,f170",
+            12,
+        )
+        if c_em == 200 and b_em:
+            d_em = json.loads(b_em)
+            # Eastmoney returns price in CNY, need to convert or use directly
+            price_val = d_em.get("data", {}).get("f43")  # latest price
+            if price_val and float(price_val) > 100:
+                # Eastmoney gold futures in CNY - this is already per gram-ish or needs conversion
+                # f43 is usually the current price
+                p_em = float(price_val)
+                if 200 < p_em < 2000:
+                    # This is likely CNY/g already for Chinese gold markets
+                    # Store as special marker
+                    results.append(("Eastmoney-CNYg", p_em))
+                    dl("  OK: %.2f (CNY/g?)" % p_em)
+                    log.info("[API-1c] Eastmoney OK: %.2f" % p_em)
+                elif 1000 < p_em < 15000:
+                    # This is USD/oz
+                    results.append(("Eastmoney", p_em))
+                    dl("  OK: $%.2f/oz" % p_em)
+                    log.info("[API-1c] Eastmoney OK: $%.2f/oz" % p_em)
+                else:
+                    dl("  Value out of range: %.2f" % p_em)
+                    log.warning("[API-1c] Eastmoney value out of range: %.2f" % p_em)
+            else:
+                dl("  No price data: %s" % str(b_em)[:100])
+                log.warning("[API-1c] Eastmoney no price: %s" % b_em[:100])
+        else:
+            dl("  HTTP %d" % c_em)
+            log.warning("[API-1c] Eastmoney HTTP %d" % c_em)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:80])
+        log.warning("[API-1c] Eastmoney ERR: %s" % str(e)[:80])
+    log.info("[API-1c] Eastmoney: %s" % ("OK" if any("Eastmoney" in x[0] for x in results) else "FAIL"))
+
+    # Source 1d: Sina Finance gold
+    dl("[1d] Sina Finance...")
+    log.info("[API-1d] Trying Sina Finance gold...")
+    try:
+        c_sn, b_sn = http_get(
+            "https://hq.sinajs.cn/list=GC00Y",
+            10,
+        )
+        if c_sn == 200 and b_sn:
+            # Sina format: var hq_str_GC00Y="...,...,price,..."
+            m = re.search(r'GC00Y="([^"]+)"', b_sn)
+            if m:
+                parts = m.group(1).split(",")
+                if len(parts) >= 6:
+                    # Sina fields: name, open, prev_close, ...
+                    try:
+                        p_sn = float(parts[3])  # Usually index 3 is current or prev close
+                        if 100 < p_sn < 15000:
+                            results.append(("Sina", p_sn))
+                            dl("  OK: %.2f" % p_sn)
+                            log.info("[API-1d] Sina OK: %.2f" % p_sn)
+                    except:
+                        pass
+            else:
+                dl("  Parse failed")
+                log.warning("[API-1d] Sina parse fail")
+        else:
+            dl("  HTTP %d" % c_sn)
+            log.warning("[API-1d] Sina HTTP %d" % c_sn)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:80])
+        log.warning("[API-1d] Sina ERR: %s" % str(e)[:80])
+
+    # Source 1e: Try metals-dev with different endpoint
+    dl("[1e] Metals-dev-v2...")
+    log.info("[API-1e] Trying metals-dev v2...")
+    try:
+        d_mv2 = jget(
+            "https://api.metals.dev/v1/live?api_key=demo&currency=USD&unit=toz&precise=true",
+            10,
+        )
+        if d_mv2 and isinstance(d_mv2.get("metals"), dict):
+            g_mv2 = d_mv2["metals"].get("gold", {})
+            if g_mv2 and g_mv2.get("price"):
+                p_mv2 = float(g_mv2["price"])
+                if 1000 < p_mv2 < 15000:
+                    results.append(("Metals.dev-v2", p_mv2))
+                    dl("  OK: $%.2f" % p_mv2)
+                    log.info("[API-1e] Metals.dev-v2 OK: $%.2f" % p_mv2)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:60])
+        log.warning("[API-1e] Metals.dev-v2 ERR: %s" % str(e)[:60])
+
     # Source 2: Yahoo Finance
     dl("[2] Yahoo Finance...")
     log.info("[API-2] Trying Yahoo Finance...")
@@ -605,13 +700,33 @@ def collect_data():
         and "history" not in src
     )
 
+    # Check if we have a direct CNY/g source (like Eastmoney)
+    cny_g_sources = [(n, p) for n, p in prices if "CNYg" in n]
+    direct_cny_g = None
+    if cny_g_sources:
+        direct_cny_g = cny_g_sources[0][1]
+        log.info("Found direct CNY/g source: %s = %.2f" % (cny_g_sources[0][0], direct_cny_g))
+
     # FX rate
     fx = get_fx_rate()
     result["usd_cny"] = fx
 
     # Calculate bank prices
-    spot_cny_g = (spot * fx) / _OZ_PER_GRAM
-    bank_base = spot_cny_g  # Bank accumulation gold ~= spot CNY/g
+    if direct_cny_g and 200 < direct_cny_g < 2000:
+        # Use direct CNY/g price!
+        spot_cny_g = direct_cny_g
+        bank_base = direct_cny_g
+        # Reverse-calculate approximate USD/oz for display
+        if fx > 0:
+            approx_usd = (direct_cny_g * _OZ_PER_GRAM) / fx
+            result["spot_usd"] = round(approx_usd, 2)
+            log.info("Using direct CNY/g: %.2f (approx $%.2f/oz)" % (direct_cny_g, approx_usd))
+        else:
+            log.info("Using direct CNY/g: %.2f (no FX)" % direct_cny_g)
+    else:
+        # Standard: convert from USD/oz
+        spot_cny_g = (spot * fx) / _OZ_PER_GRAM
+        bank_base = spot_cny_g
 
     result["spot_cny_g"] = round(spot_cny_g, 2)
     result["bank_base"] = round(bank_base, 2)
