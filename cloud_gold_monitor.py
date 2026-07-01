@@ -211,18 +211,21 @@ def git_commit_push():
 
 def get_fx_rate():
     """Get USD/CNY exchange rate."""
+    log.info("[FX] Trying to get exchange rate...")
     # Frankfurter
     d = jget("https://api.frankfurter.app/latest?from=USD&to=CNY", 12)
     if d and isinstance(d.get("rates"), dict) and d["rates"].get("CNY"):
         rate = float(d["rates"]["CNY"])
         log.info("[FX] Frankfurter: %.4f" % rate)
         return rate
+    log.warning("[FX] Frankfurter failed")
     # ER-API
     d2 = jget("https://open.er-api.com/v6/latest/USD", 12)
     if d2 and isinstance(d2.get("rates"), dict) and d2["rates"].get("CNY"):
         rate = float(d2["rates"]["CNY"])
         log.info("[FX] ER-API: %.4f" % rate)
         return rate
+    log.warning("[FX] ER-API failed")
     # Cache or fallback
     old = load_state()
     cached = old.get("last_fx")
@@ -252,6 +255,7 @@ def collect_all_prices():
 
     # Source 1: Twelve Data
     dl("[1] TwelveData...")
+    log.info("[API-1] Trying TwelveData...")
     d = jget(
         "https://api.twelvedata.com/time_series"
         "?symbol=XAU/USD&interval=1min&outputsize=1&apikey=demo",
@@ -265,12 +269,57 @@ def collect_all_prices():
                 if p > 500:
                     results.append(("TwelveData", p))
                     dl("  OK: $%.2f" % p)
+                    log.info("[API-1] TwelveData OK: $%.2f" % p)
         except Exception:
             pass
     dl("  FAIL" if not any(x[0] == "TwelveData" for x in results) else "")
+    log.info("[API-1] TwelveData: %s" % ("OK" if any(x[0]=="TwelveData" for x in results) else "FAIL"))
+
+    # Source 1b: Stooq.com (CSV, free, no key, cloud-friendly!)
+    dl("[1b] Stooq.com...")
+    log.info("[API-1b] Trying Stooq.com...")
+    try:
+        c_stooq, b_stooq = http_get(
+            "https://stooq.com/q/l/?s=gc.f&f=sd2t2ohlc&h&e=csv",
+            12,
+        )
+        if c_stooq == 200 and b_stooq:
+            lines = b_stooq.strip().split("\n")
+            # Skip header line, get last data row
+            if len(lines) >= 2:
+                parts = lines[-1].split(",")
+                # Stooq CSV: Symbol,Date,Time,Open,High,Low,Close
+                if len(parts) >= 6:
+                    close_val = parts[5].strip()
+                    if close_val and close_val != "":
+                        p = float(close_val)
+                        if 100 < p < 15000:
+                            results.append(("Stooq", p))
+                            dl("  OK: $%.2f (from CSV)" % p)
+                            log.info("[API-1b] Stooq OK: $%.2f from CSV" % p)
+                        else:
+                            dl("  Value out of range: %s" % close_val)
+                            log.warning("[API-1b] Stooq value out of range: %s" % close_val)
+                    else:
+                        dl("  Empty close value")
+                        log.warning("[API-1b] Stooq empty close value")
+                else:
+                    dl("  CSV parse fail: %d cols" % len(parts))
+                    log.warning("[API-1b] Stooq CSV format error")
+            else:
+                dl("  Too few lines: %d" % len(lines))
+                log.warning("[API-1b] Stooq too few lines")
+        else:
+            dl("  HTTP %d" % c_stooq)
+            log.warning("[API-1b] Stooq HTTP %d" % c_stooq)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:80])
+        log.warning("[API-1b] Stooq ERR: %s" % str(e)[:80])
+    log.info("[API-1b] Stooq: %s" % ("OK" if any(x[0]=="Stooq" for x in results) else "FAIL"))
 
     # Source 2: Yahoo Finance
     dl("[2] Yahoo Finance...")
+    log.info("[API-2] Trying Yahoo Finance...")
     try:
         c, b = http_get(
             "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1m",
@@ -676,7 +725,7 @@ def send_email(data):
 
     # Footer
     rc = load_state().get("run_count", 0) + 1
-    hp("</div><div class=ft>Gold Monitor v5.1 | Run #%d | GitHub Actions<br>\u81ea\u52a8\u53d1\u751f\u53d1\uff0c\u8bf7\u56de\u590d\u56de</div></div></body></html>")
+    hp("</div><div class=ft>Gold Monitor v5.2 | Run #%d | GitHub Actions<br>\u81ea\u52a8\u53d1\u751f\u53d1\uff0c\u8bf7\u56de\u590d\u56de</div></div></body></html>")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
