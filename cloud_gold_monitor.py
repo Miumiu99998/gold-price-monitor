@@ -87,7 +87,9 @@ def http_get(url, timeout=15):
         resp = urlopen(req, context=_CTX, timeout=timeout)
         return resp.status_code, resp.read().decode("utf-8", errors="replace")
     except Exception as e:
-        return 0, str(e)
+        err_str = str(e)
+        log.warning("http_get ERR [%s] %s: %s" % (type(e).__name__, url[:50], err_str[:150]))
+        return 0, err_str
 
 
 def jget(url, timeout=15):
