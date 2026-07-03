@@ -36,15 +36,20 @@ SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 RECIPIENTS = os.environ.get("RECIPIENTS", "")
 
-# Calibrated fallback values (2026-06-26)
-FALLBACK_SPOT_USD = 3750.0
-FALLBACK_USD_CNY = 7.30
+# Calibrated parameters (v6.0 - 2026-07-02)
+FALLBACK_SPOT_USD = 4098.0          # Current approximate gold price
+FALLBACK_USD_CNY = 6.80             # Current approximate FX rate
+FUTURES_PREMIUM_ADJ = 28.0         # COMEX futures(GC=F) vs spot premium (~$25-30)
+
+# Alert thresholds
+THRESHOLD_ABS = 3.0                 # Alert if price change > 3 CNY/g
+THRESHOLD_PCT = 0.005              # Alert if price change > 0.5%
 
 BANKS = {
-    "\u62db\u5546\u94f6\u884c": {"add": 5.0, "color": "#E74C3C", "fee": "\u70b9\u5dee~5\u5143/\u514b"},
-    "\u6d59\u5546\u94f6\u884c": {"add": 4.0, "color": "#3498DB", "fee": "\u624b\u7eed\u8d390.4%~0.5%"},
-    "\u5de5\u5546\u94f6\u884c": {"add": 0.0, "rate": 0.005, "color": "#C0392B", "fee": "\u4e70\u5165\u514d/\u8d4e\u56de0.5%"},
-    "\u5efa\u8bbe\u94f6\u884c": {"add": 5.5, "color": "#27AE60", "fee": "\u70b9\u5dee~6+\u8d4e\u56de0.5%"},
+    "\u62db\u5546\u94f6\u884c": {"add": 4.0, "color": "#E74C3C", "fee": "\u70b9\u5dee~4\u5143/\u514b"},
+    "\u6d59\u5546\u94f6\u884c": {"add": 3.0, "color": "#3498DB", "fee": "\u624b\u7eed\u8d390.4%~0.5%"},
+    "\u5de5\u5546\u94f6\u884c": {"add": -1.0, "rate": 0.005, "color": "#C0392B", "fee": "\u4e70\u5165\u4f18\u60e0/\u8d4e\u56de0.5%"},
+    "\u5efa\u8bbe\u94f6\u884c": {"add": 4.5, "color": "#27AE60", "fee": "\u70b9\u5dee~5+\u8d4e\u56de0.5%"},
 }
 
 # Logging
@@ -56,7 +61,7 @@ _CTX = ssl.create_default_context()
 _CST = timezone(timedelta(hours=8))
 _OZ_PER_GRAM = 31.1034768
 _STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_state.json")
-_GH_OUTPUT = os.environ.get("GITHUB_OUTPUT", "")
+_GH_OUT = os.environ.get("STATE_OUTPUT_DIR", "")
 
 
 def now_cst():
@@ -117,39 +122,38 @@ def jget(url, timeout=15):
 # ============================================================
 
 def load_state():
-    """Load state from file or GitHub output dir."""
+    """Load state from multiple possible locations (local, artifact dir, GITHUB_OUTPUT)."""
     default = {
         "run_count": 0,
         "last_spot": None,
         "last_bank_base": None,
         "last_time": None,
         "all_spots": [],
+        "all_bank_bases": [],
         "last_fx": None,
+        "alert_count": 0,
     }
-    # Try local file first
-    if os.path.exists(_STATE_FILE):
-        try:
-            with open(_STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for k in default:
-                if k not in data:
-                    data[k] = default[k]
-            return data
-        except Exception:
-            pass
-    # Try GitHub output directory
-    if _GH_OUTPUT:
-        alt_path = os.path.join(_GH_OUTPUT, "monitor_state.json")
-        if os.path.exists(alt_path):
+    # Search paths in order of priority
+    search_paths = [
+        _STATE_FILE,
+        os.path.join(os.getcwd(), "monitor_state.json"),
+        os.path.join(os.environ.get("STATE_OUTPUT_DIR", ""), "monitor_state.json"),
+        os.path.join(os.environ.get("RUNNER_TEMP", ""), "monitor_state.json"),
+    ]
+    for p in search_paths:
+        if not p:
+            continue
+        if os.path.exists(p):
             try:
-                with open(alt_path, "r", encoding="utf-8") as f:
+                with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 for k in default:
                     if k not in data:
                         data[k] = default[k]
+                log.info("Loaded state from: %s (runs=%d)" % (p, data.get("run_count", 0)))
                 return data
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Failed to load state from %s: %s" % (p, e))
     return default
 
 
@@ -700,8 +704,16 @@ def collect_data():
     result["attempts"] = [(n, round(p, 2)) for n, p in prices]
 
     # Select best
-    spot, src = select_best_price(prices, dl_internal)
-    result["spot_usd"] = spot
+    spot_raw, src = select_best_price(prices, dl_internal)
+
+    # Apply futures-to-spot adjustment if source is Yahoo (GC=F is COMEX futures)
+    spot = spot_raw
+    if "Yahoo" in src and spot_raw > 1000:
+        spot = spot_raw - FUTURES_PREMIUM_ADJ
+        log.info("Futures adjustment: $%.2f - $%.1f(premium) = $%.2f" % (spot_raw, FUTURES_PREMIUM_ADJ, spot))
+        src = src + "-adj"
+
+    result["spot_usd"] = round(spot, 2)
     result["source"] = src
     result["is_realtime"] = (
         "cache" not in src
@@ -783,10 +795,18 @@ def send_email(data):
 
     mb = data["banks"].get("\u62db\u5546\u94f6\u884c", {})
     main_buy = mb.get("buy", 0)
+    reason = data.get("alert_reason", "")
 
-    subject = "\U0001f4ca\u62db\u5546\u94f6\u884c\u79ef\u5b58\u91d1\u63d0%s\u5143/\u514b - %s" % (
-        fmt_price(main_buy),
-        data["timestamp"],
+    # Subject with direction arrow
+    if "up" in str(data).lower() or "\u2191" in str(data):
+        arrow = "\u2191"
+    elif "down" in str(data).lower() or "\u2193" in str(data):
+        arrow = "\u2193"
+    else:
+        arrow = "\U0001f4ca"
+
+    subject = "%s%s\u62db\u5546\u94f6\u884c\u79ef\u5b58\u91d1%s\u5143/\u514b - %s" % (
+        arrow, fmt_price(main_buy), data["timestamp"],
     )
 
     # Build HTML
@@ -849,9 +869,10 @@ def send_email(data):
     hp(data.get("diag", "(no diagnostic data)"))
     hp("</div>")
 
-    # Footer
+    # Footer with threshold info
     rc = load_state().get("run_count", 0) + 1
-    hp("</div><div class=ft>Gold Monitor v5.3 | Run #%d | GitHub Actions<br>\u81ea\u52a8\u53d1\u751f\u53d1\uff0c\u8bf7\u56de\u590d\u56de</div></div></body></html>")
+    ac = load_state().get("alert_count", 0)
+    hp("</div><div class=ft>Gold Monitor v6.0 | Run #%d | Alerts:#%d | \u9608\u503c%.1f\u5143/\u514b %.1f%% | GitHub Actions<br>\u81ea\u52a8\u53d1\u751f\uff0c\u8bf7\u56de\u590d\u56de</div></div></body></html>" % (rc, ac, THRESHOLD_ABS, THRESHOLD_PCT * 100))
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -909,52 +930,105 @@ def send_email(data):
 def main():
     t0 = time.time()
     log.info("=" * 50)
-    log.info("Gold Monitor v5.0 START %s" % now_cst().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("Gold Monitor v6.0 START %s" % now_cst().strftime("%Y-%m-%d %H:%M:%S"))
 
-    # Load state
+    # Load state (try artifact path first, then local)
     state = load_state()
     rc = state.get("run_count", 0) + 1
     state["run_count"] = rc
 
-    if state.get("last_time"):
+    last_bank_base = state.get("last_bank_base")
+    last_time_str = state.get("last_time", "")
+
+    if last_time_str:
         log.info(
             "Last run: %s (spot=$%s bank_base=%s)"
-            % (state["last_time"], fmt_price(state.get("last_spot")), fmt_price(state.get("last_bank_base"))),
+            % (last_time_str, fmt_price(state.get("last_spot")), fmt_price(last_bank_base))
         )
 
     # Collect data
     log.info("--- Collecting data ---")
     data = collect_data()
 
+    current_bank_base = data.get("bank_base", 0)
+    current_buy = (data["banks"].get("\u62db\u5546\u94f6\u884c", {}) or {}).get("buy", 0)
+
+    # ===== THRESHOLD-BASED ALERT LOGIC =====
+    should_alert = True
+    alert_reason = ""
+
+    if rc == 1:
+        # First run ever - always send
+        alert_reason = "first_run"
+        log.info("[ALERT] First run - always sending email")
+    elif not data.get("is_realtime"):
+        # Using fallback/cached data - always send so user knows
+        alert_reason = "non_realtime"
+        log.info("[ALERT] Non-realtime data - sending email")
+    elif last_bank_base is None or last_bank_base <= 0:
+        # No previous data
+        alert_reason = "no_history"
+        log.info("[ALERT] No previous price - sending email")
+    else:
+        # Calculate change
+        abs_change = abs(current_bank_base - last_bank_base)
+        pct_change = abs_change / last_bank_base if last_bank_base > 0 else 0
+
+        if abs_change >= THRESHOLD_ABS:
+            alert_reason = "abs_threshold(%.1f>=%.1f)" % (abs_change, THRESHOLD_ABS)
+            log.info("[ALERT] Price changed %.2f CNY/g (threshold: %.1f)" % (abs_change, THRESHOLD_ABS))
+        elif pct_change >= THRESHOLD_PCT:
+            alert_reason = "pct_threshold(%.2f%%>=%.2f%%)" % (pct_change * 100, THRESHOLD_PCT * 100)
+            log.info("[ALERT] Price changed %.2f%% (threshold: %.2f%%)" % (pct_change * 100, THRESHOLD_PCT * 100))
+        else:
+            should_alert = False
+            alert_reason = "below_threshold(%.1f, %.1f%%)" % (abs_change, pct_change * 100)
+            log.info("[SKIP] Price only changed %.2f CNY/g (%.2f%%) - below threshold" % (abs_change, pct_change * 100))
+
+    data["should_alert"] = should_alert
+    data["alert_reason"] = alert_reason
+
     # Update state with new values
     state["last_spot"] = data.get("spot_usd")
-    state["last_bank_base"] = data.get("bank_base")
+    state["last_bank_base"] = current_bank_base
     state["last_time"] = data["timestamp"]
     state["last_source"] = data.get("source")
     state["last_fx"] = data.get("usd_cny")
     state.setdefault("all_spots", []).append(data.get("spot_usd", 0))
+    state.setdefault("all_bank_bases", []).append(current_bank_base)
 
-    # Send email
-    ok = send_email(data)
-    if ok:
-        state["last_alert"] = data["timestamp"]
+    # Send email (or skip if below threshold)
+    email_sent = False
+    if should_alert:
+        ok = send_email(data)
+        email_sent = ok
+        if ok:
+            state["last_alert"] = data["timestamp"]
+            state["alert_count"] = state.get("alert_count", 0) + 1
+    else:
+        log.info("Email SKIPPED: %s" % alert_reason)
 
-    # Persist state
+    # Persist state (multiple methods for reliability)
     save_state(state)
+
+    # Also save to artifact-friendly location
+    _save_for_artifact(state)
+
     git_commit_push()
 
     # Summary
     elapsed = time.time() - t0
     summary = (
-        "Run #%d | Spot:$%.2f(%s) FX:%.4g | Base:%.4g | Buy:%.4g | Email:%s | %.1fs"
+        "Run #%d | Spot:$%.2f(%s) FX:%.4g | Base:%.4g | Buy:%.4g | Email:%s(%s) | %.1fs"
         % (
             rc,
             data.get("spot_usd", 0),
             data.get("source", "?"),
             data.get("usd_cny", 0),
-            data.get("bank_base", 0),
-            (data["banks"].get("\u62db\u5546\u94f6\u884c", {}) or {}).get("buy", 0),
-            "OK" if ok else "FAIL",
+            current_bank_base,
+            current_buy,
+            "SENT" if email_sent else "SKIP",
+            alert_reason,
             elapsed,
         )
     )
@@ -965,6 +1039,31 @@ def main():
     print("=" * 50)
 
     return 0
+
+
+def _save_for_artifact(state):
+    """Save state to artifact directory for cross-run persistence."""
+    # Save to well-known artifact paths
+    artifact_paths = [
+        os.environ.get("GITHUB_OUTPUT", ""),
+        os.environ.get("RUNNER_TEMP", ""),
+        "/tmp",
+    ]
+    for ap in artifact_paths:
+        if not ap:
+            continue
+        try:
+            os.makedirs(ap, exist_ok=True)
+            fp = os.path.join(ap, "monitor_state.json")
+            # Remove first to avoid FileExistsError
+            if os.path.exists(fp):
+                os.remove(fp)
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            log.info("State saved to artifact path: %s" % fp)
+            break
+        except Exception as e:
+            log.debug("Artifact save failed for %s: %s" % (ap, e))
 
 
 if __name__ == "__main__":
