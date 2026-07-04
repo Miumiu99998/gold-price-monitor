@@ -138,8 +138,8 @@ def load_state():
         except Exception:
             pass
     # Try GitHub output directory
-    if _GH_OUTPUT:
-        alt_path = os.path.join(_GH_OUTPUT, "monitor_state.json")
+    if _GH_OUT:
+        alt_path = os.path.join(_GH_OUT, "monitor_state.json")
         if os.path.exists(alt_path):
             try:
                 with open(alt_path, "r", encoding="utf-8") as f:
@@ -167,10 +167,10 @@ def save_state(state):
     except Exception as e:
         log.warning("Save state failed: %s" % e)
     # Write to GitHub_OUTPUT (uploaded as artifact) - use unique name
-    if _GH_OUTPUT:
+    if _GH_OUT:
         try:
-            os.makedirs(_GH_OUTPUT, exist_ok=True)
-            alt_path = os.path.join(_GH_OUTPUT, "monitor_state.json")
+            os.makedirs(_GH_OUT, exist_ok=True)
+            alt_path = os.path.join(_GH_OUT, "monitor_state.json")
             # Remove existing file if present
             if os.path.exists(alt_path):
                 os.remove(alt_path)
