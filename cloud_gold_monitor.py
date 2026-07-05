@@ -40,6 +40,11 @@ RECIPIENTS = os.environ.get("RECIPIENTS", "")
 FALLBACK_SPOT_USD = 3750.0
 FALLBACK_USD_CNY = 7.30
 
+# Futures premium discount: Yahoo GC=F is COMEX futures (~2.5% above spot)
+# Calibrated: actual bank ~911 vs system ~918 -> need ~-7 CNY/g adjustment
+FUTURE_DISCOUNT_RATE = 0.9925   # Convert futures to spot equivalent
+FUTURE_DISCOUNT_FIXED = -6.0     # Fixed CNY/g discount
+
 BANKS = {
     "\u62db\u5546\u94f6\u884c": {"add": 5.0, "color": "#E74C3C", "fee": "\u70b9\u5dee~5\u5143/\u514b"},
     "\u6d59\u5546\u94f6\u884c": {"add": 4.0, "color": "#3498DB", "fee": "\u624b\u7eed\u8d390.4%~0.5%"},
@@ -738,6 +743,14 @@ def collect_data():
         # Standard: convert from USD/oz
         spot_cny_g = (spot * fx) / _OZ_PER_GRAM
         bank_base = spot_cny_g
+
+    # Apply futures premium discount for sources that return COMEX futures (GC=F)
+    # Yahoo Finance returns futures which trade ~2.5% above spot
+    is_futures_src = any(k in src for k in ["Yahoo", "Stooq", "median"])
+    if is_futures_src:
+        old_base = bank_base
+        bank_base = (bank_base * FUTURE_DISCOUNT_RATE) + FUTURE_DISCOUNT_FIXED
+        dl("Futures discount: %.2f -> %.2f (rate=%.4f fixed=%.1f)" % (old_base, bank_base, FUTURE_DISCOUNT_RATE, FUTURE_DISCOUNT_FIXED))
 
     result["spot_cny_g"] = round(spot_cny_g, 2)
     result["bank_base"] = round(bank_base, 2)
