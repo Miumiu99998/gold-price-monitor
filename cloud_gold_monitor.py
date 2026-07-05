@@ -43,7 +43,7 @@ FALLBACK_USD_CNY = 7.30
 # Futures premium discount: Yahoo GC=F is COMEX futures (~2.5% above spot)
 # Calibrated: actual bank ~911 vs system ~918 -> need ~-7 CNY/g adjustment
 FUTURE_DISCOUNT_RATE = 0.9925   # Convert futures to spot equivalent
-FUTURE_DISCOUNT_FIXED = -3.0     # Fixed CNY/g discount
+FUTURE_DISCOUNT_FIXED = 2.0     # Fixed CNY/g discount
 
 BANKS = {
     "\u62db\u5546\u94f6\u884c": {"add": 5.0, "color": "#E74C3C", "fee": "\u70b9\u5dee~5\u5143/\u514b"},
