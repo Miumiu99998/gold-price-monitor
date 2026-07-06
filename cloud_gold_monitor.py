@@ -42,7 +42,7 @@ FALLBACK_USD_CNY = 7.30
 
 # Futures premium discount: Yahoo GC=F is COMEX futures (~2.5% above spot)
 # Calibrated: actual bank ~911 vs system ~918 -> need ~-7 CNY/g adjustment
-FUTURE_DISCOUNT_RATE = 0.9935   # Convert futures to spot equivalent
+FUTURE_DISCOUNT_RATE = 0.9962   # Convert futures to spot equivalent
 FUTURE_DISCOUNT_FIXED = 0.0     # Fixed CNY/g discount (negative = reduce price)
 
 BANKS = {
@@ -461,6 +461,64 @@ def collect_all_prices():
     except Exception as e:
         dl("  ERR: %s" % str(e)[:80])
 
+    # Source 2b: Yahoo GLD ETF (tracks spot gold, ~1/10 oz per share)
+    dl("[2b] Yahoo GLD ETF...")
+    try:
+        c_gld, b_gld = http_get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/GLD?range=1d&interval=1m",
+            12,
+        )
+        if c_gld == 200:
+            jd_gld = json.loads(b_gld)
+            meta_gld = (
+                jd_gld.get("chart", {}).get("result", [{}])[0].get("meta", {})
+                if jd_gld.get("chart", {}).get("result") else {}
+            )
+            gld_price = float(meta_gld.get("regularMarketPrice", 0) or meta_gld.get("previousClose", 0) or 0)
+            if 100 < gld_price < 500:
+                # GLD ≈ 1/10 oz → spot ≈ GLD * 10
+                spot_from_gld = gld_price * 10.0
+                if 1500 < spot_from_gld < 15000:
+                    results.append(("Yahoo-GLD", spot_from_gld))
+                    dl("  OK: GLD=%.2f -> $%.2f/oz" % (gld_price, spot_from_gld))
+                else:
+                    dl("  GLD price out of range: %.2f -> $%.2f" % (gld_price, spot_from_gld))
+            else:
+                dl("  No usable GLD price: %s" % str(gld_price))
+        else:
+            dl("  HTTP %d" % c_gld)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:60])
+
+    # Source 2c: Yahoo IAU ETF (iShares Gold Trust, another spot tracker)
+    dl("[2c] Yahoo IAU ETF...")
+    try:
+        c_iau, b_iau = http_get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/IAU?range=1d&interval=1m",
+            12,
+        )
+        if c_iau == 200:
+            jd_iau = json.loads(b_iau)
+            meta_iau = (
+                jd_iau.get("chart", {}).get("result", [{}])[0].get("meta", {})
+                if jd_iau.get("chart", {}).get("result") else {}
+            )
+            iau_price = float(meta_iau.get("regularMarketPrice", 0) or meta_iau.get("previousClose", 0) or 0)
+            if 10 < iau_price < 100:
+                # IAU ≈ 1/100 oz → spot ≈ IAU * 100
+                spot_from_iau = iau_price * 100.0
+                if 1500 < spot_from_iau < 15000:
+                    results.append(("Yahoo-IAU", spot_from_iau))
+                    dl("  OK: IAU=%.2f -> $%.2f/oz" % (iau_price, spot_from_iau))
+                else:
+                    dl("  IAU out of range: %.2f -> $%.2f" % (iau_price, spot_from_iau))
+            else:
+                dl("  No usable IAU price")
+        else:
+            dl("  HTTP %d" % c_iau)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:60])
+
     # Source 3: metals-dev
     dl("[3] metals-dev...")
     d = jget(
@@ -746,7 +804,7 @@ def collect_data():
 
     # Apply futures premium discount for sources that return COMEX futures (GC=F)
     # Yahoo Finance returns futures which trade ~2.5% above spot
-    is_futures_src = any(k in src for k in ["Yahoo", "Stooq", "median"])
+    is_futures_src = any(k in src for k in ["Yahoo", "Stooq", "median"]) and not any(k in src for k in ["GLD", "IAU", "CNYg"])
     if is_futures_src:
         old_base = bank_base
         bank_base = (bank_base * FUTURE_DISCOUNT_RATE) + FUTURE_DISCOUNT_FIXED
