@@ -42,7 +42,7 @@ FALLBACK_USD_CNY = 7.30
 
 # Futures premium discount: Yahoo GC=F is COMEX futures (~2.5% above spot)
 # Calibrated: actual bank ~911 vs system ~918 -> need ~-7 CNY/g adjustment
-FUTURE_DISCOUNT_RATE = 0.9962   # Convert futures to spot equivalent
+FUTURE_DISCOUNT_RATE = 1.0   # No discount needed with ETF sources   # Convert futures to spot equivalent
 FUTURE_DISCOUNT_FIXED = 0.0     # Fixed CNY/g discount (negative = reduce price)
 
 BANKS = {
@@ -804,8 +804,12 @@ def collect_data():
 
     # Apply futures premium discount for sources that return COMEX futures (GC=F)
     # Yahoo Finance returns futures which trade ~2.5% above spot
-    is_futures_src = any(k in src for k in ["Yahoo", "Stooq", "median"]) and not any(k in src for k in ["GLD", "IAU", "CNYg"])
-    if is_futures_src:
+    # Only apply futures discount when all sources are futures-type (no ETF/spot trackers)
+    # GLD/IAU already track spot gold closely - no discount needed for them
+    has_etf_or_spot = any(k in src for k in ["GLD", "IAU", "CNYg", "Eastmoney"])
+    is_futures_only = any(k in src for k in ["Yahoo", "Stooq"]) and not has_etf_or_spot and "median" not in src
+    is_futures_mixed = "median" in src and not has_etf_or_spot
+    if is_futures_only or is_futures_mixed:
         old_base = bank_base
         bank_base = (bank_base * FUTURE_DISCOUNT_RATE) + FUTURE_DISCOUNT_FIXED
         dl("Futures discount: %.2f -> %.2f (rate=%.4f fixed=%.1f)" % (old_base, bank_base, FUTURE_DISCOUNT_RATE, FUTURE_DISCOUNT_FIXED))
