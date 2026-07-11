@@ -856,10 +856,10 @@ def send_email(data):
         log.error("Missing email config")
         return False
 
-    mb = data["banks"].get("\u62db\u5546\u94f6\u884c", {})
+    mb = data["banks"].get("\u6d59\u5546\u94f6\u884c", {})
     main_buy = mb.get("buy", 0)
 
-    subject = "\U0001f4ca\u62db\u5546\u94f6\u884c\u79ef\u5b58\u91d1\u63d0%s\u5143/\u514b - %s" % (
+    subject = "\U0001f4ca\u6d59\u5546\u94f6\u884c\u79ef\u5b58\u91d1\u63d0%s\u5143/\u514b - %s" % (
         fmt_price(main_buy),
         data["timestamp"],
     )
@@ -900,14 +900,14 @@ def send_email(data):
     cur_buy = mb.get("buy", 0)
     cur_sell = mb.get("sell", 0)
     hp("<div class=card style=border-left-color:%s>" % mb.get("color", "#E74C3C"))
-    hp("<div class=pname>\U0001f3e0 %s \u79ef\u5b58</div>" % "\u62db\u5546\u94f6\u884c")
+    hp("<div class=pname>\U0001f3e0 %s \u79ef\u5b58</div>" % "\u6d59\u5546\u94f6\u884c")
     hp("<div class=prow><div class=col><span class=lbl>\u4e70\u5165\u4ef7</span><br><span style='%s'>%s</span> <small style=color:#888>\u5143/\u514b</small></div>" % (pval_style, fmt_price(cur_buy)))
     hp("<div class=col><span class=lbl>\u5356\u51fa/\u8d4e\u56de</span><br><span class=sell>%s</span> <small style=color:#888>\u5143/\u514b</small></div>" % fmt_price(cur_sell))
     hp("<div class=fee>%s</div>" % mb.get("fee", ""))
     hp("</div>")
 
     # Other banks
-    other = {k: v for k, v in data["banks"].items() if k != "\u62db\u5546\u94f6\u884c"}
+    other = {k: v for k, v in data["banks"].items() if k != "\u6d59\u5546\u94f6\u884c"}
     if other:
         hp("<div style='margin-top:16px;font-size:13px;color:#555;border-top:1px dashed #ddd;padding-top:8px'>")
         hp("\u5176\u4ed6\u94f6\u884c\u79ef\u5b58\u62a5\u683c (\u5143/\u514b)</div>")
