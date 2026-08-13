@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cloud_gold_monitor.py v5.0 - Bank Gold Price Monitor (GitHub Actions)
+cloud_gold_monitor.py v5.6 - Bank Gold Price Monitor (GitHub Actions)
 ==========================================================
 Changes from v4.6:
   - Fallback price: $3750/oz (matches ~Jun 2026 real price)
@@ -519,6 +519,84 @@ def collect_all_prices():
     except Exception as e:
         dl("  ERR: %s" % str(e)[:60])
 
+    # Source 2d: Yahoo GOLD=F (mini gold futures)
+    dl("[2d] Yahoo Mini Gold Futures...")
+    try:
+        c_mg, b_mg = http_get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/GOLD%3DF?range=1d&interval=1m",
+            12,
+        )
+        if c_mg == 200:
+            jd_mg = json.loads(b_mg)
+            meta_mg = (
+                jd_mg.get("chart", {}).get("result", [{}])[0].get("meta", {})
+                if jd_mg.get("chart", {}).get("result") else {}
+            )
+            mg_price = float(meta_mg.get("regularMarketPrice", 0) or meta_mg.get("previousClose", 0) or 0)
+            if 1800 < mg_price < 15000:
+                results.append(("Yahoo-GOLD-F", mg_price))
+                dl("  OK: $%.2f/oz" % mg_price)
+            else:
+                dl("  Out of range: %.2f" % mg_price)
+        else:
+            dl("  HTTP %d" % c_mg)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:60])
+
+    # Source 2e: metals.dev with CNY/gram direct
+    dl("[2e] metals.dev CNY/g...")
+    d_cny = jget(
+        "https://api.metals.dev/v1/latest?api_key=demo&currency=CNY&unit=gram",
+        10,
+    )
+    if d_cny and isinstance(d_cny.get("metals"), dict):
+        g_cny = d_cny["metals"].get("gold", {})
+        if g_cny and g_cny.get("price"):
+            pg = float(g_cny["price"])
+            if 200 < pg < 2000:
+                # Convert back to USD/oz for comparison
+                fx_tmp = get_fx_rate()
+                if fx_tmp:
+                    pu = (pg * _OZ_PER_GRAM) / fx_tmp
+                    if 1500 < pu < 15000:
+                        results.append(("Metals-CNYg(%.0f)" % pg, pu))
+                        dl("  OK: %.2f CNY/g -> $%.2f/oz" % (pg, pu))
+    dl("  FAIL" if not any("Metals-CNYg" in x[0] for x in results[len(results)-3:]) else "")
+
+    # Source 2f: investing.com gold scrape
+    dl("[2f] Investing.com...")
+    try:
+        c_inv, b_inv = http_get(
+            "https://api.investing.com/api/financialdata/8830?lang=1",
+            10,
+        )
+        if c_inv == 200:
+            try:
+                inv_d = json.loads(b_inv)
+                # Try various paths for last price
+                lp = None
+                for path_str in ["data","last","quote","lastPrice"]:
+                    obj = inv_d
+                    for key in path_str.split("."):
+                        if isinstance(obj, dict) and key in obj:
+                            obj = obj[key]
+                        else:
+                            break
+                    else:
+                        if isinstance(obj, (int,float)) and obj > 100:
+                            lp = float(obj); break
+                if lp and 1000 < lp < 15000:
+                    results.append(("Investing", lp))
+                    dl("  OK: $%.2f/oz" % lp)
+                else:
+                    dl("  No usable price")
+            except:
+                dl("  Parse fail")
+        else:
+            dl("  HTTP %d" % c_inv)
+    except Exception as e:
+        dl("  ERR: %s" % str(e)[:60])
+
     # Source 3: metals-dev
     dl("[3] metals-dev...")
     d = jget(
@@ -859,7 +937,17 @@ def send_email(data):
     mb = data["banks"].get("\u6d59\u5546\u94f6\u884c", {})
     main_buy = mb.get("buy", 0)
 
-    subject = "\U0001f4ca\u6d59\u5546\u94f6\u884c\u79ef\u5b58\u91d1\u63d0%s\u5143/\u514b - %s" % (
+    # Trend arrow
+    old_state_data = load_state()
+    hist_base = old_state_data.get("last_bank_base") if old_state_data else None
+    if hist_base and hist_base > 0:
+        diff = mb.get("buy", 0) - (hist_base + 4.0)
+        if diff > 0.5: arrow = "\U0001f53c"
+        elif diff < -0.5: arrow = "\U0001f53d"
+        else: arrow = "\U0001f4a0"
+    else:
+        arrow = "\U0001f4a0"
+    subject = "%s\U0001f4ca\u6d59\u5546\u94f6\u884c\u79ef\u5b58\u91d1\u63d0%s\u5143/\u514b - %s" % (arrow,
         fmt_price(main_buy),
         data["timestamp"],
     )
